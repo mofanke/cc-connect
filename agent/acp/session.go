@@ -33,8 +33,9 @@ type acpSession struct {
 	cmd *exec.Cmd
 	tr  *transport
 
-	acpSessMu sync.RWMutex
-	acpSessID string
+	acpSessMu      sync.RWMutex
+	acpSessID      string
+	loadingHistory atomic.Bool
 
 	sendMu        sync.Mutex
 	configMu      sync.RWMutex
@@ -213,7 +214,9 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			"cwd":        s.workDir,
 			"mcpServers": []any{},
 		}
+		s.loadingHistory.Store(true)
 		loadRes, err := s.tr.call(s.ctx, "session/load", loadParams)
+		s.loadingHistory.Store(false)
 		if err != nil {
 			slog.Warn("acp: session/load failed, starting new session", "error", err)
 		} else {
@@ -447,8 +450,12 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 		s.absorbConfigOptions(configUpdate.Update.ConfigOptions)
 		return
 	}
-	s.cacheToolCallInput(params)
 	s.maybeAbsorbCurrentModeUpdate(params)
+	// No event consumer exists until session/load finishes replaying history.
+	if s.loadingHistory.Load() {
+		return
+	}
+	s.cacheToolCallInput(params)
 	sid := s.currentACPSessionID()
 	// Debug log to capture raw session/update JSON for troubleshooting vendor compatibility
 	slog.Debug("acp: session/update", "session_id", sid, "params", string(params))
