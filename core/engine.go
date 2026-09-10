@@ -9778,6 +9778,95 @@ func sanitizeTelegramMenuCommand(cmd string) string {
 	return result
 }
 
+func supportsSessionConfig(agent Agent) bool {
+	capability, ok := agent.(SessionConfigurableAgent)
+	return ok && capability.SupportsSessionConfig()
+}
+
+func (e *Engine) sessionConfigCard(p Platform, msg *Message, category, input string) *Card {
+	title, command := MsgCardTitleModel, "/model"
+	if category == "thought_level" {
+		title, command = MsgCardTitleReasoning, "/reasoning"
+	}
+	failure := func(err error) *Card { return e.simpleCard(e.i18n.T(title), "red", e.i18n.Tf(MsgError, err)) }
+	agent, sessions, key, err := e.commandContext(p, msg)
+	if err != nil {
+		return failure(err)
+	}
+	session := sessions.GetOrCreateActive(key)
+	if !session.TryLock() {
+		return failure(fmt.Errorf("%s", e.i18n.T(MsgLiveConfigBusy)))
+	}
+	defer session.UnlockWithoutUpdate()
+	state := e.getOrCreateInteractiveStateWith(key, p, msg.ReplyCtx, session, sessions, agent, msg.SessionKey)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	live, ok := state.agentSession.(LiveSessionConfigurer)
+	if !ok {
+		return failure(fmt.Errorf("%s", e.i18n.Tf(MsgLiveConfigUnavailable, category)))
+	}
+	find := func() (SessionConfigOption, bool) {
+		for _, option := range live.SessionConfigOptions() {
+			if option.Category == category && option.Type == "select" {
+				return option, true
+			}
+		}
+		return SessionConfigOption{}, false
+	}
+	option, ok := find()
+	if !ok {
+		return failure(fmt.Errorf("%s", e.i18n.Tf(MsgLiveConfigUnavailable, category)))
+	}
+	if strings.TrimSpace(input) != "" {
+		target := strings.TrimSpace(input)
+		if category == "model" {
+			var valid bool
+			target, valid = parseModelSwitchArgs(strings.Fields(input))
+			if !valid {
+				return failure(fmt.Errorf("%s", e.i18n.T(MsgModelUsage)))
+			}
+		}
+		if index, err := strconv.Atoi(target); err == nil && index > 0 && index <= len(option.Options) {
+			target = option.Options[index-1].Value
+		}
+		valid := false
+		for _, value := range option.Options {
+			if strings.EqualFold(value.Value, target) || strings.EqualFold(value.Name, target) {
+				target, valid = value.Value, true
+				break
+			}
+		}
+		if !valid {
+			return failure(fmt.Errorf("%s", e.i18n.Tf(MsgLiveConfigInvalid, target)))
+		}
+		if err := live.SetSessionConfigOption(e.ctx, option.ID, target); err != nil {
+			return failure(err)
+		}
+		option, ok = find()
+		if !ok {
+			return failure(fmt.Errorf("%s", e.i18n.Tf(MsgLiveConfigUnavailable, category)))
+		}
+		sessions.Save()
+	}
+	var choices []CardSelectOption
+	current := ""
+	for _, value := range option.Options {
+		action := "act:" + command + " " + value.Value
+		choices = append(choices, CardSelectOption{Text: value.Name, Value: action})
+		if value.Value == option.CurrentValue {
+			current = action
+		}
+	}
+	currentMessage, placeholder := MsgModelCurrent, MsgModelSelectPlaceholder
+	if category == "thought_level" {
+		currentMessage, placeholder = MsgReasoningCurrent, MsgReasoningSelectPlaceholder
+	}
+	return NewCard().Title(e.i18n.T(title), "indigo").
+		Markdown(e.i18n.Tf(currentMessage, option.CurrentValue)).
+		Select(e.i18n.T(placeholder), choices, current).
+		Buttons(e.cardBackButton()).Build()
+}
+
 func (e *Engine) cmdModel(p Platform, msg *Message, args []string) bool {
 	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
@@ -9785,6 +9874,10 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) bool {
 		return true
 	}
 
+	if supportsSessionConfig(agent) {
+		e.replyWithCard(p, msg.ReplyCtx, e.sessionConfigCard(p, msg, "model", strings.Join(args, " ")))
+		return true
+	}
 	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
 		if agent != nil && agent.Name() == "acp" {
@@ -10004,6 +10097,10 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 		return
 	}
 
+	if supportsSessionConfig(agent) {
+		e.replyWithCard(p, msg.ReplyCtx, e.sessionConfigCard(p, msg, "thought_level", strings.Join(args, " ")))
+		return
+	}
 	switcher, ok := agent.(ReasoningEffortSwitcher)
 	if !ok {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgReasoningNotSupported))
@@ -12151,6 +12248,25 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	if i := strings.IndexByte(body, ' '); i >= 0 {
 		cmd = body[:i]
 		args = strings.TrimSpace(body[i+1:])
+	}
+
+	if (prefix == "act" || prefix == "nav") && (cmd == "/model" || cmd == "/reasoning") {
+		agent, _ := e.sessionContextForKey(sessionKey)
+		if supportsSessionConfig(agent) {
+			for _, p := range e.platforms {
+				if p.Name() == extractPlatformName(sessionKey) {
+					category := "model"
+					if cmd == "/reasoning" {
+						category = "thought_level"
+					}
+					if prefix == "nav" {
+						args = ""
+					}
+					return e.sessionConfigCard(p, &Message{SessionKey: sessionKey}, category, args)
+				}
+			}
+			return e.simpleCard(e.i18n.T(MsgError), "red", e.i18n.T(MsgSessionNotFound))
+		}
 	}
 
 	if prefix == "act" && cmd == "/model" {

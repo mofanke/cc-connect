@@ -277,13 +277,21 @@ func TestProbeListSessions_parsesSessions(t *testing.T) {
 // fakeCallbacks captures reportModes / reportListSupported invocations
 // so tests can assert on them deterministically.
 type fakeCallbacks struct {
-	mu         sync.Mutex
-	modes      []acpModesBlock
-	listCalls  []bool
+	mu        sync.Mutex
+	modes     []acpModesBlock
+	listCalls []bool
 }
 
-func (f *fakeCallbacks) reportModes(b acpModesBlock)       { f.mu.Lock(); f.modes = append(f.modes, b); f.mu.Unlock() }
-func (f *fakeCallbacks) reportListSupported(supported bool) { f.mu.Lock(); f.listCalls = append(f.listCalls, supported); f.mu.Unlock() }
+func (f *fakeCallbacks) reportModes(b acpModesBlock) {
+	f.mu.Lock()
+	f.modes = append(f.modes, b)
+	f.mu.Unlock()
+}
+func (f *fakeCallbacks) reportListSupported(supported bool) {
+	f.mu.Lock()
+	f.listCalls = append(f.listCalls, supported)
+	f.mu.Unlock()
+}
 func (f *fakeCallbacks) lastModes() (acpModesBlock, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -320,6 +328,155 @@ func newTestSession(t *testing.T, cb sessionCallbacks) (*acpSession, *io.PipeWri
 		rReq.Close()
 	})
 	return s, wResp, rReq
+}
+
+func TestSession_LoadHistoryExceedingEventBufferDoesNotBlock(t *testing.T) {
+	for _, loadFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("loadFails=%t", loadFails), func(t *testing.T) {
+			cb := &fakeCallbacks{}
+			s, wResp, rReq := newTestSession(t, cb)
+			deadline := time.AfterFunc(3*time.Second, func() {
+				s.cancel()
+				wResp.Close()
+				rReq.Close()
+			})
+			defer deadline.Stop()
+
+			go func() {
+				sc := bufio.NewScanner(rReq)
+				for sc.Scan() {
+					var req struct {
+						ID     json.RawMessage `json:"id"`
+						Method string          `json:"method"`
+					}
+					if json.Unmarshal(sc.Bytes(), &req) != nil {
+						return
+					}
+					switch req.Method {
+					case "initialize":
+						fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}`+"\n", req.ID)
+					case "session/load":
+						for i := 0; i < 256; i++ {
+							if _, err := io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}`+"\n"); err != nil {
+								return
+							}
+						}
+						io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}`+"\n")
+						io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a"}]}}}`+"\n")
+						if loadFails {
+							fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"load failed"}}`+"\n", req.ID)
+						} else {
+							fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{}}`+"\n", req.ID)
+						}
+					case "session/new":
+						fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fresh-session"}}`+"\n", req.ID)
+					case "session/prompt":
+						io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live answer"}}}}`+"\n")
+						fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", req.ID)
+						return
+					}
+				}
+			}()
+
+			if err := s.handshake("test-session-id", ""); err != nil {
+				t.Fatalf("handshake blocked while replaying history: %v", err)
+			}
+			if len(s.events) != 0 {
+				t.Fatalf("history leaked into live events: %d", len(s.events))
+			}
+			if mode, ok := cb.lastModes(); !ok || mode.CurrentModeID != "plan" {
+				t.Fatal("mode update lost during replay")
+			}
+			if options := s.SessionConfigOptions(); len(options) != 1 || options[0].CurrentValue != "a" {
+				t.Fatal("config update lost during replay")
+			}
+			wantID := "test-session-id"
+			if loadFails {
+				wantID = "fresh-session"
+			}
+			if s.CurrentSessionID() != wantID {
+				t.Fatalf("session ID = %q, want %q", s.CurrentSessionID(), wantID)
+			}
+			if err := s.Send("continue", "msg", nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if len(s.events) != 2 {
+				t.Fatalf("expected live text and result, got %d events", len(s.events))
+			}
+			if ev := <-s.events; ev.Type != core.EventText || ev.Content != "live answer" || ev.SessionID != wantID {
+				t.Fatalf("unexpected live event: %+v", ev)
+			}
+			if ev := <-s.events; ev.Type != core.EventResult || !ev.Done {
+				t.Fatalf("unexpected completion event: %+v", ev)
+			}
+		})
+	}
+}
+
+func TestSession_ConfigHotSwitch(t *testing.T) {
+	s, wResp, rReq := newTestSession(t, nil)
+	options := []core.SessionConfigOption{{ID: "model", Category: "model", Type: "select", CurrentValue: "a", Options: []core.SessionConfigValue{{Value: "a", Name: "A"}, {Value: "b", Name: "B"}}}}
+	s.absorbConfigOptions(options)
+	copy := s.SessionConfigOptions()
+	copy[0].Options[0].Value = "mutated"
+	if s.SessionConfigOptions()[0].Options[0].Value != "a" {
+		t.Fatal("config snapshot aliases session state")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sc := bufio.NewScanner(rReq)
+		for n := 0; n < 2 && sc.Scan(); n++ {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params struct {
+					SessionID string `json:"sessionId"`
+					ConfigID  string `json:"configId"`
+					Value     string `json:"value"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(sc.Bytes(), &req) != nil {
+				return
+			}
+			if req.Method != "session/set_config_option" || req.Params.SessionID != "test-session-id" || req.Params.ConfigID != "model" {
+				return
+			}
+			if n == 1 {
+				fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"rejected"}}`+"\n", req.ID)
+				return
+			}
+			response := s.SessionConfigOptions()
+			response[0].CurrentValue = req.Params.Value
+			data, _ := json.Marshal(map[string]any{"configOptions": response})
+			fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":%s}`+"\n", req.ID, data)
+		}
+	}()
+	if err := s.SetSessionConfigOption(context.Background(), "model", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if s.SessionConfigOptions()[0].CurrentValue != "b" || s.CurrentSessionID() != "test-session-id" {
+		t.Fatal("config/session mismatch")
+	}
+	if err := s.SetSessionConfigOption(context.Background(), "model", "a"); err == nil {
+		t.Fatal("RPC rejection ignored")
+	}
+	<-done
+	if s.SessionConfigOptions()[0].CurrentValue != "b" {
+		t.Fatal("failed RPC changed config")
+	}
+	if err := s.SetSessionConfigOption(context.Background(), "model", "unknown"); err == nil {
+		t.Fatal("invalid option accepted")
+	}
+	s.sendMu.Lock()
+	if err := s.SetSessionConfigOption(context.Background(), "model", "a"); err == nil {
+		t.Fatal("busy session accepted switch")
+	}
+	s.sendMu.Unlock()
+	s.onNotification("session/update", json.RawMessage(`{"update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a"}]}}`))
+	if s.SessionConfigOptions()[0].CurrentValue != "a" {
+		t.Fatal("notification not applied")
+	}
 }
 
 func TestSession_SetLiveMode_success(t *testing.T) {

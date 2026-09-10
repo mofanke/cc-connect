@@ -5,12 +5,94 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
+
+func TestAvailableModels_UsesConfiguredCLI(t *testing.T) {
+	if os.Getenv("GO_WANT_AGY_MODELS_HELPER") == "1" {
+		if os.Args[len(os.Args)-1] != "models" || os.Getenv("MODEL_ENV") != "session" || os.Getenv("CONFIG_ONLY") != "yes" || os.Getenv("GEMINI_API_KEY") != "provider-key" {
+			os.Exit(2)
+		}
+		wd, _ := os.Getwd()
+		if wd != os.Getenv("EXPECTED_WORKDIR") {
+			os.Exit(3)
+		}
+		_, _ = io.WriteString(os.Stdout, "Fetching available models...\nmodel-one\tModel One\nclaude-sonnet-4-6\tClaude Sonnet 4.6\nmodel-one\tDuplicate\ninvalid\n\tMissing ID\n")
+		os.Exit(0)
+	}
+	wd := t.TempDir()
+	a := &Agent{cmd: os.Args[0], cliExtraArgs: []string{"-test.run=^TestAvailableModels_UsesConfiguredCLI$", "--"}, workDir: wd,
+		configEnv: []string{"GO_WANT_AGY_MODELS_HELPER=1", "MODEL_ENV=config", "CONFIG_ONLY=yes", "EXPECTED_WORKDIR=" + wd},
+		providers: []core.ProviderConfig{{APIKey: "provider-key"}}, activeIdx: 0,
+		sessionEnv: []string{"MODEL_ENV=session"}}
+	got := a.AvailableModels(context.Background())
+	want := []core.ModelOption{{Name: "model-one", Desc: "Model One"}, {Name: "claude-sonnet-4-6", Desc: "Claude Sonnet 4.6"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("models = %#v, want %#v", got, want)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := a.AvailableModels(ctx); len(got) != 0 {
+		t.Fatalf("cancelled discovery returned stale models: %#v", got)
+	}
+	a.cmd = filepath.Join(t.TempDir(), "missing-agy")
+	if got := a.AvailableModels(context.Background()); len(got) != 0 {
+		t.Fatalf("failed discovery returned stale models: %#v", got)
+	}
+	a.providers[0].Models = want[:1]
+	if got := a.AvailableModels(context.Background()); !reflect.DeepEqual(got, want[:1]) {
+		t.Fatalf("configured models not preferred: %#v", got)
+	}
+}
+
+func TestReasoningAndModelReachSession(t *testing.T) {
+	a, err := New(map[string]any{"cmd": os.Args[0], "work_dir": t.TempDir(), "model": "claude-sonnet-4-6", "reasoning_effort": " HIGH ", "mode": "plan", "env": map[string]string{"CONFIG_ONLY": "a=b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := a.(core.ReasoningEffortSwitcher)
+	if rs.GetReasoningEffort() != "high" || !reflect.DeepEqual(rs.AvailableReasoningEfforts(), []string{"low", "medium", "high"}) {
+		t.Fatal("reasoning options not initialized")
+	}
+	rs.SetReasoningEffort("med")
+	a.(core.SessionEnvInjector).SetSessionEnv([]string{"SESSION_ONLY=yes"})
+	opts := a.(core.WorkspaceAgentOptionSnapshotter).WorkspaceAgentOptions()
+	opts["work_dir"] = t.TempDir()
+	copyAgent, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(copyAgent.(*Agent).configEnv, []string{"CONFIG_ONLY=a=b"}) {
+		t.Fatalf("config env not preserved: %#v", opts)
+	}
+	s, err := copyAgent.StartSession(context.Background(), "existing-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	args := s.(*antigravitySession).buildAntigravityArgs("existing-session", true, "plan", "", "hello")
+	want := []string{"--effort", "medium", "--model", "claude-sonnet-4-6", "--conversation", "existing-session", "--sandbox", "-p", "hello"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+	rs.SetReasoningEffort("xhigh")
+	if rs.GetReasoningEffort() != "" {
+		t.Fatal("unsupported effort should use CLI default")
+	}
+}
+
+func TestParseModelLines_EmptyOrMalformed(t *testing.T) {
+	for _, out := range []string{"", "Fetching available models...\n", "bad\n\tmissing\nid\t\n"} {
+		if got := parseModelLines(out); len(got) != 0 {
+			t.Fatalf("unexpected models: %#v", got)
+		}
+	}
+}
 
 func TestSlugify(t *testing.T) {
 	tests := []struct {

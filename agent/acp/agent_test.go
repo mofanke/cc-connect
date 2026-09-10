@@ -3,6 +3,7 @@ package acp
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -24,6 +25,47 @@ func fakeTraeCLIOnPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestTraeReasoningEffortAndSessionArgs(t *testing.T) {
+	fakeTraeCLIOnPath(t)
+	a, err := New(map[string]any{"cmd": "traecli", "args": []string{"acp", "serve"}, "model": "GPT-5.6-Sol", "reasoning_effort": " HIGH "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, ok := a.(core.ReasoningEffortSwitcher)
+	if !ok {
+		t.Fatal("Trae CLI missing reasoning interface")
+	}
+	if rs.GetReasoningEffort() != "high" || !reflect.DeepEqual(rs.AvailableReasoningEfforts(), []string{"low", "medium", "high", "xhigh"}) {
+		t.Fatal("unexpected reasoning options")
+	}
+	for input, want := range map[string]string{"low": "low", "med": "medium", "high": "high", "x-high": "xhigh", "bogus": "", "": ""} {
+		rs.SetReasoningEffort(input)
+		if got := rs.GetReasoningEffort(); got != want {
+			t.Fatalf("effort(%q) = %q, want %q", input, got, want)
+		}
+	}
+	rs.SetReasoningEffort("x-high")
+	copyAgent, err := New(a.(core.WorkspaceAgentOptionSnapshotter).WorkspaceAgentOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := copyAgent.(*TraeAgent).sessionArgsLocked()
+	want := []string{"-c", `model="GPT-5.6-Sol"`, "-c", `model_reasoning_effort="xhigh"`, "acp", "serve"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+	generic, err := New(map[string]any{"cmd": os.Args[0], "args": []string{"serve"}, "model": "ignored", "reasoning_effort": "high"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := generic.(core.ReasoningEffortSwitcher); ok {
+		t.Fatal("generic ACP must not expose reasoning")
+	}
+	if got := generic.(*Agent).sessionArgsLocked(); !reflect.DeepEqual(got, []string{"serve"}) {
+		t.Fatalf("generic args changed: %#v", got)
+	}
 }
 
 func TestNew_DisplayNameDefault(t *testing.T) {

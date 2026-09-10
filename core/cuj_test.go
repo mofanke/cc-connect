@@ -45,6 +45,93 @@ import (
 // agent "replies" for each user prompt, without bringing up a real LLM.
 // ---------------------------------------------------------------------------
 
+type liveConfigTestAgent struct {
+	stubAgent
+	session *liveConfigTestSession
+	starts  int
+}
+
+func (a *liveConfigTestAgent) SupportsSessionConfig() bool { return true }
+func (a *liveConfigTestAgent) StartSession(context.Context, string) (AgentSession, error) {
+	a.starts++
+	return a.session, nil
+}
+
+type liveConfigTestSession struct {
+	stubAgentSession
+	options []SessionConfigOption
+	closed  bool
+	fail    bool
+}
+
+func (s *liveConfigTestSession) Close() error                                { s.closed = true; return nil }
+func (s *liveConfigTestSession) SessionConfigOptions() []SessionConfigOption { return s.options }
+func (s *liveConfigTestSession) SetSessionConfigOption(_ context.Context, id, value string) error {
+	if s.fail {
+		return errors.New("RPC rejected")
+	}
+	for i := range s.options {
+		if s.options[i].ID == id {
+			s.options[i].CurrentValue = value
+		}
+	}
+	return nil
+}
+
+func TestCUJ_M1_LiveConfigPreservesSessionAndHistory(t *testing.T) {
+	live := &liveConfigTestSession{options: []SessionConfigOption{
+		{ID: "model", Category: "model", Type: "select", CurrentValue: "a", Options: []SessionConfigValue{{Value: "a", Name: "Model A"}, {Value: "b", Name: "Model B"}}},
+		{ID: "reasoning_effort", Category: "thought_level", Type: "select", CurrentValue: "low", Options: []SessionConfigValue{{Value: "low", Name: "Low"}, {Value: "high", Name: "High"}}},
+	}}
+	agent := &liveConfigTestAgent{session: live}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("live-config", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	session := e.sessions.GetOrCreateActive("test:chat:user")
+	session.AddHistory("user", "keep this context")
+	for _, cmd := range []string{"/model", "/model b", "/reasoning high"} {
+		p.clearSent()
+		e.ReceiveMessage(p, &Message{SessionKey: "test:chat:user", UserID: "user", Content: cmd})
+		if len(p.getSent()) == 0 {
+			t.Fatalf("no reply for %s", cmd)
+		}
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "high") {
+		t.Fatalf("missing selected effort: %s", got)
+	}
+	card := e.handleCardNav("act:/model a", "test:chat:user")
+	if card == nil || !strings.Contains(card.RenderText(), "a") {
+		t.Fatal("model card action failed")
+	}
+	card = e.handleCardNav("act:/reasoning low", "test:chat:user")
+	if card == nil || !strings.Contains(card.RenderText(), "low") {
+		t.Fatal("reasoning card action failed")
+	}
+	live.fail = true
+	card = e.handleCardNav("act:/model b", "test:chat:user")
+	if !strings.Contains(card.RenderText(), "RPC rejected") || live.options[0].CurrentValue != "a" {
+		t.Fatal("failed RPC changed selection or hid error")
+	}
+	live.fail = false
+	card = e.handleCardNav("act:/reasoning invalid", "test:chat:user")
+	if !strings.Contains(card.RenderText(), "Unsupported selection") {
+		t.Fatal("invalid selection accepted")
+	}
+	if !session.TryLock() {
+		t.Fatal("session remained busy after command")
+	}
+	card = e.handleCardNav("act:/model b", "test:chat:user")
+	session.UnlockWithoutUpdate()
+	if !strings.Contains(card.RenderText(), "busy") {
+		t.Fatal("busy session not protected")
+	}
+	if agent.starts != 1 || live.closed || session.GetAgentSessionID() != "stub-session" {
+		t.Fatalf("session restarted: starts=%d closed=%v", agent.starts, live.closed)
+	}
+	if history := session.GetHistory(0); len(history) != 1 || history[0].Content != "keep this context" {
+		t.Fatalf("history lost: %#v", history)
+	}
+}
+
 // cujAgent is a controllable Agent that returns a configurable AgentSession
 // per StartSession call. Tests can mutate cujAgentSession.reply between
 // turns to simulate different agent responses.

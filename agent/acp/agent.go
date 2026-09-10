@@ -21,16 +21,17 @@ func init() {
 
 // Agent runs an ACP (Agent Client Protocol) agent subprocess over stdio JSON-RPC.
 type Agent struct {
-	workDir      string
-	cmd          string
-	cliExtraArgs []string // extra args from cmd, prepended before args
-	args         []string
-	staticEnv    map[string]string
-	extraEnv     []string
-	sessionEnv   []string
-	authMethod   string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
-	displayName  string // optional, for doctor (default "ACP")
-	model        string // optional, for Trae CLI ACP only
+	workDir         string
+	cmd             string
+	cliExtraArgs    []string // extra args from cmd, prepended before args
+	args            []string
+	staticEnv       map[string]string
+	extraEnv        []string
+	sessionEnv      []string
+	authMethod      string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
+	displayName     string // optional, for doctor (default "ACP")
+	model           string // optional, for Trae CLI ACP only
+	reasoningEffort string
 
 	// mode is the pending permission mode to apply to new sessions.
 	// When set, StartSession applies it via session/set_mode right after
@@ -98,18 +99,20 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode = strings.TrimSpace(mode)
 	model, _ := opts["model"].(string)
 	model = strings.TrimSpace(model)
+	effort, _ := opts["reasoning_effort"].(string)
 
 	agent := &Agent{
-		workDir:      workDir,
-		cmd:          cmdStr,
-		cliExtraArgs: cliExtraArgs,
-		args:         args,
-		staticEnv:    staticEnv,
-		extraEnv:     extra,
-		authMethod:   authMethod,
-		displayName:  displayName,
-		mode:         mode,
-		model:        model,
+		workDir:         workDir,
+		cmd:             cmdStr,
+		cliExtraArgs:    cliExtraArgs,
+		args:            args,
+		staticEnv:       staticEnv,
+		extraEnv:        extra,
+		authMethod:      authMethod,
+		displayName:     displayName,
+		mode:            mode,
+		model:           model,
+		reasoningEffort: normalizeTraeReasoningEffort(effort),
 	}
 	if isTraeCLICommand(cmdStr) {
 		return &TraeAgent{Agent: agent}, nil
@@ -226,6 +229,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.model != "" {
 		opts["model"] = a.model
 	}
+	if a.reasoningEffort != "" {
+		opts["reasoning_effort"] = a.reasoningEffort
+	}
 	return opts
 }
 
@@ -238,10 +244,7 @@ func (a *Agent) SetSessionEnv(env []string) {
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.RLock()
 	command := a.cmd
-	allArgs := append(append([]string{}, a.cliExtraArgs...), a.args...)
-	if model := a.traeModelOverrideLocked(); model != "" {
-		allArgs = append([]string{"-c", fmt.Sprintf("model=%q", model)}, allArgs...)
-	}
+	allArgs := a.sessionArgsLocked()
 	workDir := a.workDir
 	authMethod := a.authMethod
 	pendingMode := a.mode
@@ -263,19 +266,12 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 
 func (a *Agent) Stop() error { return nil }
 
-// TraeAgent wraps the generic ACP adapter with Trae CLI-specific model
-// discovery and selection. ACP itself has no generic model-switch RPC, but
-// Trae exposes `models --json` and accepts `-c model=...` before `acp serve`.
+// TraeAgent exposes live session configuration and CLI defaults for new sessions.
 type TraeAgent struct {
 	*Agent
 }
 
-// -- ModelSwitcher for Trae CLI ACP --
-//
-// ACP itself does not define a generic model-list/model-set RPC. Trae CLI exposes
-// models through its local CLI and accepts model overrides before `acp serve`, so
-// cc-connect can provide IM-side model cards for Trae without affecting other ACP
-// agents such as Cursor, Copilot, Devin, or OpenClaw.
+func (a *TraeAgent) SupportsSessionConfig() bool { return true }
 
 func (a *TraeAgent) SetModel(model string) {
 	model = strings.TrimSpace(model)
@@ -301,11 +297,48 @@ func (a *TraeAgent) AvailableModels(ctx context.Context) []core.ModelOption {
 	return fetchTraeModels(ctx, cmd, workDir, extra)
 }
 
-func (a *Agent) traeModelOverrideLocked() string {
-	if !isTraeCLICommand(a.cmd) {
+func (a *Agent) sessionArgsLocked() []string {
+	args := append(append([]string{}, a.cliExtraArgs...), a.args...)
+	if isTraeCLICommand(a.cmd) {
+		if a.reasoningEffort != "" {
+			args = append([]string{"-c", fmt.Sprintf("model_reasoning_effort=%q", a.reasoningEffort)}, args...)
+		}
+		if a.model != "" {
+			args = append([]string{"-c", fmt.Sprintf("model=%q", a.model)}, args...)
+		}
+	}
+	return args
+}
+
+func (a *TraeAgent) SetReasoningEffort(effort string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reasoningEffort = normalizeTraeReasoningEffort(effort)
+}
+
+func (a *TraeAgent) GetReasoningEffort() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.reasoningEffort
+}
+
+func (a *TraeAgent) AvailableReasoningEfforts() []string {
+	return []string{"low", "medium", "high", "xhigh"}
+}
+
+func normalizeTraeReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return "low"
+	case "medium", "med":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh", "x-high", "very-high":
+		return "xhigh"
+	default:
 		return ""
 	}
-	return strings.TrimSpace(a.model)
 }
 
 func isTraeCLICommand(cmd string) bool {

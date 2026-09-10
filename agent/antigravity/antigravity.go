@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,17 +29,18 @@ func init() {
 //   - "yolo":      auto-approve all tools (--dangerously-skip-permissions)
 //   - "plan":      read-only plan mode with terminal sandbox constraints (--sandbox)
 type Agent struct {
-	workDir      string
-	model        string
-	mode         string
-	cmd          string   // CLI binary name, default "agy"
-	cliExtraArgs []string // extra args from cmd after the binary name
-	configEnv    []string // env vars from [projects.agent.options.env]
-	timeout      time.Duration
-	providers    []core.ProviderConfig
-	activeIdx    int
-	sessionEnv   []string
-	mu           sync.RWMutex
+	workDir         string
+	model           string
+	reasoningEffort string
+	mode            string
+	cmd             string   // CLI binary name, default "agy"
+	cliExtraArgs    []string // extra args from cmd after the binary name
+	configEnv       []string // env vars from [projects.agent.options.env]
+	timeout         time.Duration
+	providers       []core.ProviderConfig
+	activeIdx       int
+	sessionEnv      []string
+	mu              sync.RWMutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -49,6 +49,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		workDir = "."
 	}
 	model, _ := opts["model"].(string)
+	effort, _ := opts["reasoning_effort"].(string)
 	mode, _ := opts["mode"].(string)
 	mode = normalizeMode(mode)
 	cmd, extraArgs := core.ParseCmdOpts(opts, "agy")
@@ -76,14 +77,15 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	return &Agent{
-		workDir:      workDir,
-		model:        model,
-		mode:         mode,
-		cmd:          cmd,
-		cliExtraArgs: extraArgs,
-		configEnv:    core.ParseConfigEnv(opts),
-		timeout:      timeout,
-		activeIdx:    -1,
+		workDir:         workDir,
+		model:           model,
+		reasoningEffort: normalizeReasoningEffort(effort),
+		mode:            mode,
+		cmd:             cmd,
+		cliExtraArgs:    extraArgs,
+		configEnv:       core.ParseConfigEnv(opts),
+		timeout:         timeout,
+		activeIdx:       -1,
 	}, nil
 }
 
@@ -136,64 +138,93 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 	if models := a.configuredModels(); len(models) > 0 {
 		return models
 	}
-	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
-		return models
+	a.mu.RLock()
+	command := a.cmd
+	args := append(append([]string(nil), a.cliExtraArgs...), "models")
+	workDir := a.workDir
+	env := append([]string(nil), a.configEnv...)
+	env = append(env, a.providerEnvLocked()...)
+	env = append(env, a.sessionEnv...)
+	a.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.Dir = workDir
+	cmd.Env = core.MergeEnv(os.Environ(), env)
+	out, err := cmd.Output()
+	if err != nil {
+		slog.Warn("antigravity: agy models failed", "error", err)
+		return nil
 	}
-	return []core.ModelOption{
-		{Name: "gemini-3.1-pro-preview", Desc: "Gemini 3.1 Pro Preview"},
-		{Name: "gemini-3-flash-preview", Desc: "Gemini 3 Flash Preview"},
-		{Name: "gemini-2.5-pro", Desc: "Gemini 2.5 Pro"},
-		{Name: "gemini-2.5-flash", Desc: "Gemini 2.5 Flash"},
+	models := parseModelLines(string(out))
+	if len(models) == 0 {
+		slog.Warn("antigravity: agy models returned no model entries")
+	}
+	return models
+}
+
+func parseModelLines(out string) []core.ModelOption {
+	var models []core.ModelOption
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(out, "\n") {
+		id, name, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		id, name = strings.TrimSpace(id), strings.TrimSpace(name)
+		if !ok || id == "" || name == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		models = append(models, core.ModelOption{Name: id, Desc: name})
+	}
+	return models
+}
+
+func normalizeReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return "low"
+	case "medium", "med":
+		return "medium"
+	case "high":
+		return "high"
+	default:
+		return ""
 	}
 }
 
-func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("GOOGLE_API_KEY")
-	}
-	if apiKey == "" {
-		return nil
-	}
+func (a *Agent) SetReasoningEffort(effort string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reasoningEffort = normalizeReasoningEffort(effort)
+}
 
-	url := "https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil
-	}
+func (a *Agent) GetReasoningEffort() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.reasoningEffort
+}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Debug("antigravity: failed to fetch models", "error", err)
-		return nil
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
+func (a *Agent) AvailableReasoningEfforts() []string {
+	return []string{"low", "medium", "high"}
+}
 
-	var result struct {
-		Models []struct {
-			Name        string `json:"name"`
-			DisplayName string `json:"displayName"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil
-	}
-
-	var models []core.ModelOption
-	for _, m := range result.Models {
-		id := strings.TrimPrefix(m.Name, "models/")
-		if !strings.HasPrefix(id, "gemini-") {
-			continue
+func (a *Agent) WorkspaceAgentOptions() map[string]any {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	env := make(map[string]string)
+	for _, entry := range a.configEnv {
+		if key, value, ok := strings.Cut(entry, "="); ok {
+			env[key] = value
 		}
-		models = append(models, core.ModelOption{Name: id, Desc: m.DisplayName})
 	}
-	sort.Slice(models, func(i, j int) bool { return models[i].Name > models[j].Name })
-	return models
+	return map[string]any{
+		"cmd":              append([]string{a.cmd}, a.cliExtraArgs...),
+		"env":              env,
+		"model":            a.model,
+		"mode":             a.mode,
+		"reasoning_effort": a.reasoningEffort,
+		"timeout_mins":     int64(a.timeout / time.Minute),
+	}
 }
 
 func (a *Agent) SetSessionEnv(env []string) {
@@ -208,6 +239,9 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	mode := a.mode
 	cmd := a.cmd
 	extraArgs := append([]string{}, a.cliExtraArgs...)
+	if a.reasoningEffort != "" {
+		extraArgs = append(extraArgs, "--effort", a.reasoningEffort)
+	}
 	workDir := a.workDir
 	timeout := a.timeout
 	extraEnv := append([]string(nil), a.configEnv...)

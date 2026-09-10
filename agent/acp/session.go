@@ -36,7 +36,9 @@ type acpSession struct {
 	acpSessMu sync.RWMutex
 	acpSessID string
 
-	sendMu sync.Mutex
+	sendMu        sync.Mutex
+	configMu      sync.RWMutex
+	configOptions []core.SessionConfigOption
 
 	permMu   sync.Mutex
 	permByID map[string]permState
@@ -216,11 +218,15 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			slog.Warn("acp: session/load failed, starting new session", "error", err)
 		} else {
 			var lr struct {
-				SessionID string         `json:"sessionId"`
-				Modes     *acpModesBlock `json:"modes"`
+				SessionID     string                     `json:"sessionId"`
+				Modes         *acpModesBlock             `json:"modes"`
+				ConfigOptions []core.SessionConfigOption `json:"configOptions"`
 			}
-			if json.Unmarshal(loadRes, &lr) == nil && lr.SessionID != "" {
-				s.setACPSessionID(lr.SessionID)
+			if json.Unmarshal(loadRes, &lr) == nil {
+				if lr.SessionID != "" {
+					s.setACPSessionID(lr.SessionID)
+				}
+				s.absorbConfigOptions(lr.ConfigOptions)
 				s.absorbModes(lr.Modes)
 				return nil
 			}
@@ -236,8 +242,9 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 		return fmt.Errorf("acp: session/new: %w", err)
 	}
 	var sn struct {
-		SessionID string         `json:"sessionId"`
-		Modes     *acpModesBlock `json:"modes"`
+		SessionID     string                     `json:"sessionId"`
+		Modes         *acpModesBlock             `json:"modes"`
+		ConfigOptions []core.SessionConfigOption `json:"configOptions"`
 	}
 	if err := json.Unmarshal(newRes, &sn); err != nil {
 		return fmt.Errorf("acp: parse session/new: %w", err)
@@ -246,6 +253,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 		return fmt.Errorf("acp: session/new: empty sessionId")
 	}
 	s.setACPSessionID(sn.SessionID)
+	s.absorbConfigOptions(sn.ConfigOptions)
 	s.absorbModes(sn.Modes)
 	return nil
 }
@@ -365,9 +373,78 @@ func (s *acpSession) matchAvailableMode(input string) string {
 	return ""
 }
 
+func (s *acpSession) absorbConfigOptions(options []core.SessionConfigOption) {
+	if options == nil {
+		return
+	}
+	s.configMu.Lock()
+	s.configOptions = options
+	s.configMu.Unlock()
+}
+
+func (s *acpSession) SessionConfigOptions() []core.SessionConfigOption {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	options := append([]core.SessionConfigOption(nil), s.configOptions...)
+	for i := range options {
+		options[i].Options = append([]core.SessionConfigValue(nil), options[i].Options...)
+	}
+	return options
+}
+
+func (s *acpSession) SetSessionConfigOption(ctx context.Context, id, value string) error {
+	if !s.sendMu.TryLock() {
+		return fmt.Errorf("acp: session is busy")
+	}
+	defer s.sendMu.Unlock()
+	if !s.alive.Load() {
+		return fmt.Errorf("acp: session closed")
+	}
+	valid := false
+	for _, opt := range s.SessionConfigOptions() {
+		if opt.ID != id {
+			continue
+		}
+		for _, v := range opt.Options {
+			if v.Value == value {
+				valid = true
+			}
+		}
+	}
+	if !valid {
+		return fmt.Errorf("acp: unsupported config option %s=%s", id, value)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	res, err := s.tr.call(ctx, "session/set_config_option", map[string]any{
+		"sessionId": s.currentACPSessionID(), "configId": id, "value": value,
+	})
+	if err != nil {
+		return fmt.Errorf("acp: set config option: %w", err)
+	}
+	var out struct {
+		ConfigOptions []core.SessionConfigOption `json:"configOptions"`
+	}
+	if err := json.Unmarshal(res, &out); err != nil {
+		return fmt.Errorf("acp: parse config options: %w", err)
+	}
+	s.absorbConfigOptions(out.ConfigOptions)
+	return nil
+}
+
 func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	if method != "session/update" {
 		slog.Debug("acp: notification", "method", method)
+		return
+	}
+	var configUpdate struct {
+		Update struct {
+			Kind          string                     `json:"sessionUpdate"`
+			ConfigOptions []core.SessionConfigOption `json:"configOptions"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &configUpdate) == nil && configUpdate.Update.Kind == "config_option_update" {
+		s.absorbConfigOptions(configUpdate.Update.ConfigOptions)
 		return
 	}
 	s.cacheToolCallInput(params)

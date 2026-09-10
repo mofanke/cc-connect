@@ -443,6 +443,29 @@ type ReasoningEffortSwitcher interface {
 	AvailableReasoningEfforts() []string
 }
 
+type SessionConfigurableAgent interface {
+	SupportsSessionConfig() bool
+}
+
+type SessionConfigOption struct {
+	ID           string               `json:"id"`
+	Name         string               `json:"name"`
+	Category     string               `json:"category"`
+	Type         string               `json:"type"`
+	CurrentValue string               `json:"currentValue"`
+	Options      []SessionConfigValue `json:"options"`
+}
+
+type SessionConfigValue struct {
+	Value string `json:"value"`
+	Name  string `json:"name"`
+}
+
+type LiveSessionConfigurer interface {
+	SessionConfigOptions() []SessionConfigOption
+	SetSessionConfigOption(ctx context.Context, id, value string) error
+}
+
 // ModelOption describes a selectable model.
 type ModelOption struct {
 	Name  string // model identifier passed to CLI
