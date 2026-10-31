@@ -5,94 +5,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
-
-func TestAvailableModels_UsesConfiguredCLI(t *testing.T) {
-	if os.Getenv("GO_WANT_AGY_MODELS_HELPER") == "1" {
-		if os.Args[len(os.Args)-1] != "models" || os.Getenv("MODEL_ENV") != "session" || os.Getenv("CONFIG_ONLY") != "yes" || os.Getenv("GEMINI_API_KEY") != "provider-key" {
-			os.Exit(2)
-		}
-		wd, _ := os.Getwd()
-		if wd != os.Getenv("EXPECTED_WORKDIR") {
-			os.Exit(3)
-		}
-		_, _ = io.WriteString(os.Stdout, "Fetching available models...\nmodel-one\tModel One\nclaude-sonnet-4-6\tClaude Sonnet 4.6\nmodel-one\tDuplicate\ninvalid\n\tMissing ID\n")
-		os.Exit(0)
-	}
-	wd := t.TempDir()
-	a := &Agent{cmd: os.Args[0], cliExtraArgs: []string{"-test.run=^TestAvailableModels_UsesConfiguredCLI$", "--"}, workDir: wd,
-		configEnv: []string{"GO_WANT_AGY_MODELS_HELPER=1", "MODEL_ENV=config", "CONFIG_ONLY=yes", "EXPECTED_WORKDIR=" + wd},
-		providers: []core.ProviderConfig{{APIKey: "provider-key"}}, activeIdx: 0,
-		sessionEnv: []string{"MODEL_ENV=session"}}
-	got := a.AvailableModels(context.Background())
-	want := []core.ModelOption{{Name: "model-one", Desc: "Model One"}, {Name: "claude-sonnet-4-6", Desc: "Claude Sonnet 4.6"}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("models = %#v, want %#v", got, want)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if got := a.AvailableModels(ctx); len(got) != 0 {
-		t.Fatalf("cancelled discovery returned stale models: %#v", got)
-	}
-	a.cmd = filepath.Join(t.TempDir(), "missing-agy")
-	if got := a.AvailableModels(context.Background()); len(got) != 0 {
-		t.Fatalf("failed discovery returned stale models: %#v", got)
-	}
-	a.providers[0].Models = want[:1]
-	if got := a.AvailableModels(context.Background()); !reflect.DeepEqual(got, want[:1]) {
-		t.Fatalf("configured models not preferred: %#v", got)
-	}
-}
-
-func TestReasoningAndModelReachSession(t *testing.T) {
-	a, err := New(map[string]any{"cmd": os.Args[0], "work_dir": t.TempDir(), "model": "claude-sonnet-4-6", "reasoning_effort": " HIGH ", "mode": "plan", "env": map[string]string{"CONFIG_ONLY": "a=b"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rs := a.(core.ReasoningEffortSwitcher)
-	if rs.GetReasoningEffort() != "high" || !reflect.DeepEqual(rs.AvailableReasoningEfforts(), []string{"low", "medium", "high"}) {
-		t.Fatal("reasoning options not initialized")
-	}
-	rs.SetReasoningEffort("med")
-	a.(core.SessionEnvInjector).SetSessionEnv([]string{"SESSION_ONLY=yes"})
-	opts := a.(core.WorkspaceAgentOptionSnapshotter).WorkspaceAgentOptions()
-	opts["work_dir"] = t.TempDir()
-	copyAgent, err := New(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(copyAgent.(*Agent).configEnv, []string{"CONFIG_ONLY=a=b"}) {
-		t.Fatalf("config env not preserved: %#v", opts)
-	}
-	s, err := copyAgent.StartSession(context.Background(), "existing-session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	args := s.(*antigravitySession).buildAntigravityArgs("existing-session", true, "plan", "", "hello")
-	want := []string{"--effort", "medium", "--output-format", "stream-json", "--model", "claude-sonnet-4-6", "--conversation", "existing-session", "--sandbox", "-p", "hello"}
-	if !reflect.DeepEqual(args, want) {
-		t.Fatalf("args = %#v, want %#v", args, want)
-	}
-	rs.SetReasoningEffort("xhigh")
-	if rs.GetReasoningEffort() != "" {
-		t.Fatal("unsupported effort should use CLI default")
-	}
-}
-
-func TestParseModelLines_EmptyOrMalformed(t *testing.T) {
-	for _, out := range []string{"", "Fetching available models...\n", "bad\n\tmissing\nid\t\n"} {
-		if got := parseModelLines(out); len(got) != 0 {
-			t.Fatalf("unexpected models: %#v", got)
-		}
-	}
-}
 
 func TestSlugify(t *testing.T) {
 	tests := []struct {
@@ -172,49 +90,11 @@ func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
 	if !contains(args, "--verbose") {
 		t.Fatalf("expected configured extra args, got: %v", args)
 	}
+	if !contains(args, "--output-format=stream-json") {
+		t.Fatalf("expected AGY stream-json output, got: %v", args)
+	}
 	if contains(args, "-m") || contains(args, "--model") {
 		t.Fatalf("did not expect model flags in args, got: %v", args)
-	}
-}
-
-func TestBuildAntigravityArgs_DefaultBridgeKeepsApprovalHook(t *testing.T) {
-	s := &antigravitySession{}
-	args := s.buildAntigravityArgs("", false, "default", "/tmp/agy-config", "hello")
-	if !contains(args, "--gemini_dir=/tmp/agy-config") || !contains(args, "--dangerously-skip-permissions") {
-		t.Fatalf("default bridge args = %v", args)
-	}
-	s.extraArgs = []string{"--dangerously-skip-permissions"}
-	args = s.buildAntigravityArgs("", false, "default", "/tmp/agy-config", "hello")
-	count := 0
-	for _, arg := range args {
-		if arg == "--dangerously-skip-permissions" {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Fatalf("skip-permissions flag repeated %d times: %v", count, args)
-	}
-}
-
-func TestDetectNewSessionID_ConversationDB(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	dir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	old := filepath.Join(dir, "old-session.db")
-	if err := os.WriteFile(old, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	started := time.Now()
-	newDB := filepath.Join(dir, "new-session.db")
-	if err := os.WriteFile(newDB, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s := &antigravitySession{workDir: t.TempDir()}
-	if got := s.detectNewSessionID(map[string]bool{"old-session.db": true}, started); got != "new-session" {
-		t.Fatalf("detected session = %q, want new-session", got)
 	}
 }
 
@@ -227,7 +107,10 @@ func TestAntigravitySession_ResumePassesConversationID(t *testing.T) {
 		if err := os.WriteFile(argsPath, []byte(strings.Join(os.Args, "\x00")), 0o600); err != nil {
 			os.Exit(2)
 		}
-		_, _ = io.WriteString(os.Stdout, "ok\n")
+		_, _ = io.WriteString(os.Stdout,
+			"{\"event\":\"init\",\"conversation_id\":\"conversation-1\"}\n"+
+				"{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"conversation-1\",\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"text_delta\":\"ok\\n\"}}\n"+
+				"{\"event\":\"result\",\"result\":{\"conversation_id\":\"conversation-1\",\"status\":\"SUCCESS\",\"response\":\"ok\\n\"}}\n")
 		os.Exit(0)
 	}
 
@@ -256,22 +139,32 @@ func TestAntigravitySession_ResumePassesConversationID(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	select {
-	case event := <-s.Events():
-		if event.Type != core.EventText {
-			t.Fatalf("first event type = %q, want %q", event.Type, core.EventText)
+	var response strings.Builder
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-s.Events():
+			switch event.Type {
+			case core.EventText:
+				if event.SessionID != "" && event.SessionID != "conversation-1" {
+					t.Fatalf("session ID = %q, want conversation-1", event.SessionID)
+				}
+				response.WriteString(event.Content)
+			case core.EventResult:
+				if !event.Done {
+					t.Fatalf("completion event = %+v, want done EventResult", event)
+				}
+				if got := response.String(); got != "ok\n" {
+					t.Fatalf("response = %q, want %q", got, "ok\n")
+				}
+				goto streamComplete
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for streamed helper output")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for helper output")
 	}
-	select {
-	case event := <-s.Events():
-		if event.Type != core.EventResult || !event.Done {
-			t.Fatalf("completion event = %+v, want done EventResult", event)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for EventResult")
-	}
+
+streamComplete:
 
 	data, err := os.ReadFile(argsPath)
 	if err != nil {

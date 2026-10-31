@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -82,14 +81,6 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	preEntries := make(map[string]bool)
 	homeDir, err := os.UserHomeDir()
 	if err == nil {
-		conversationsDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "conversations")
-		if entries, err := os.ReadDir(conversationsDir); err == nil {
-			for _, entry := range entries {
-				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".db") {
-					preEntries[entry.Name()] = true
-				}
-			}
-		}
 		slug := antigravityProjectSlug(as.workDir)
 		chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
 		if entries, err := os.ReadDir(chatsDir); err == nil {
@@ -159,6 +150,9 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 		agyConfigDir = as.permissionBridge.AgyConfigDir()
 	}
 	args := as.buildAntigravityArgs(chatID, isResume, as.mode, agyConfigDir, fullPrompt)
+	if strings.TrimSpace(as.model) != "" {
+		slog.Warn("antigravitySession: model is configured but ignored because agy does not support --model yet", "model", as.model)
+	}
 
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -216,10 +210,6 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	// Prepend extra args from cmd so wrappers like "timeout 3600 agy" work.
 	// Keep "-p <prompt>" at the very end because agy consumes the immediate next arg.
 	args := append([]string{}, as.extraArgs...)
-	args = append(args, "--output-format", "stream-json")
-	if model := strings.TrimSpace(as.model); model != "" {
-		args = append(args, "--model", model)
-	}
 	if agyConfigDir != "" {
 		// Antigravity currently names this compatibility flag --gemini_dir.
 		args = append(args, "--gemini_dir="+agyConfigDir, "--print-timeout=24h")
@@ -227,14 +217,8 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	if isResume {
 		args = append(args, "--conversation", chatID)
 	}
+	args = append(args, "--output-format=stream-json")
 	switch mode {
-	case "default":
-		// Agy's headless mode may ignore a PreToolUse hook's allow decision and
-		// soft-deny a tool without producing stdout. The bridge hook remains the
-		// permission gate; bypass only Agy's separate interactive approval step.
-		if agyConfigDir != "" && !slices.Contains(args, "--dangerously-skip-permissions") {
-			args = append(args, "--dangerously-skip-permissions")
-		}
 	case "yolo":
 		args = append(args, "--dangerously-skip-permissions")
 	case "plan":
@@ -246,7 +230,6 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 
 func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempFiles []string, preEntries map[string]bool, sendStartedAt time.Time) {
 	defer as.wg.Done()
-	stream := newAgyStream(as)
 	defer func() {
 		for _, f := range tempFiles {
 			_ = os.Remove(f)
@@ -278,7 +261,7 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		}
 
 		sid := as.CurrentSessionID()
-		if err != nil && stream.result.Error == nil {
+		if err != nil {
 			stderrMsg := strings.TrimSpace(stderrBuf.String())
 			if stderrMsg != "" {
 				slog.Error("antigravitySession: process failed", "error", err, "stderr", stderrMsg)
@@ -286,19 +269,12 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
 				case <-as.ctx.Done():
 				}
-			} else if ctx.Err() != nil {
-				stream.result.Error = fmt.Errorf("antigravity: %w", ctx.Err())
-			} else {
-				stream.result.Error = fmt.Errorf("antigravity: process failed: %w", err)
 			}
 		}
 
 		// Finalize turn.
-		stream.result.SessionID = sid
-		stream.result.Type = core.EventResult
-		stream.result.Done = true
 		select {
-		case as.events <- stream.result:
+		case as.events <- core.Event{Type: core.EventResult, SessionID: sid, Done: true}:
 		case <-as.ctx.Done():
 		}
 	}()
@@ -308,22 +284,35 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		_ = stdout.Close()
 	}()
 
-	reader := bufio.NewReader(stdout)
-
-	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			stream.handleLine(line)
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
+	parser := newAgyOutputParser()
+	streamFormatDetected := false
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		isStreamEvent, events := parser.parseLine(line)
+		if isStreamEvent {
+			streamFormatDetected = true
+		} else if !streamFormatDetected {
+			// Keep compatibility with wrappers or older CLIs that ignore the
+			// output-format flag and still write plain text.
+			events = []core.Event{{Type: core.EventText, Content: string(line) + "\n"}}
+		} else {
+			continue
 		}
-		if err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "file already closed") {
-				slog.Error("antigravitySession: read error", "error", err)
-				select {
-				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}:
-				case <-as.ctx.Done():
-				}
+		for _, event := range events {
+			select {
+			case as.events <- event:
+			case <-as.ctx.Done():
+				return
 			}
-			return
+		}
+	}
+	if err := scanner.Err(); err != nil && !strings.Contains(err.Error(), "file already closed") {
+		slog.Error("antigravitySession: read error", "error", err)
+		select {
+		case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}:
+		case <-as.ctx.Done():
 		}
 	}
 }
@@ -332,9 +321,6 @@ func (as *antigravitySession) detectNewSessionID(preEntries map[string]bool, sen
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return ""
-	}
-	if id := detectNewConversationDB(filepath.Join(homeDir, ".gemini", "antigravity-cli", "conversations"), preEntries, sendStartedAt); id != "" {
-		return id
 	}
 	slug := antigravityProjectSlug(as.workDir)
 	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
@@ -405,33 +391,6 @@ func (as *antigravitySession) detectNewSessionID(preEntries map[string]bool, sen
 		return candidates[i].diff < candidates[j].diff
 	})
 	return candidates[0].sessionID
-}
-
-func detectNewConversationDB(dir string, preEntries map[string]bool, sendStartedAt time.Time) string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	type candidate struct {
-		id      string
-		modTime time.Time
-	}
-	var candidates []candidate
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") || preEntries[entry.Name()] {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || (!sendStartedAt.IsZero() && info.ModTime().Before(sendStartedAt.Add(-2*time.Second))) {
-			continue
-		}
-		candidates = append(candidates, candidate{strings.TrimSuffix(entry.Name(), ".db"), info.ModTime()})
-	}
-	if len(candidates) == 0 {
-		return ""
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].modTime.After(candidates[j].modTime) })
-	return candidates[0].id
 }
 
 func (as *antigravitySession) RespondPermission(requestID string, result core.PermissionResult) error {

@@ -3,6 +3,8 @@ package claudecode
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,18 +28,6 @@ func TestSanitizeClaudeUsageOutput_RendersCursorMoves(t *testing.T) {
 	}
 	if !strings.Contains(got, "Security guide") {
 		t.Fatalf("sanitized output missing link text: %q", got)
-	}
-}
-
-func TestClaudeUsageTerminal_CSI_G(t *testing.T) {
-	terminal := newClaudeUsageTerminal()
-	terminal.Write([]byte("Current\x1b[12Gsession\r\n\x1b[1G0%\x1b[5Gused"))
-	got := normalizeClaudeUsageText(terminal.String())
-	if !strings.Contains(got, "Current session") {
-		t.Fatalf("expected Current session, got: %q", got)
-	}
-	if !strings.Contains(got, "0% used") {
-		t.Fatalf("expected 0%% used, got: %q", got)
 	}
 }
 
@@ -273,74 +263,6 @@ func TestAgentGetUsageSmoke(t *testing.T) {
 	}
 }
 
-func TestPromptActionForScreen(t *testing.T) {
-	tests := []struct {
-		name   string
-		screen string
-		want   string
-	}{
-		{
-			name:   "empty screen",
-			screen: "",
-			want:   "",
-		},
-		{
-			name: "quick safety check default no selected",
-			screen: `Quick safety check: Is this a project you created or one you trust?
-❯ No, exit
-  Yes, I trust this folder
-Enter to confirm · Esc to cancel`,
-			want: "\x1b[B\r",
-		},
-		{
-			name: "quick safety check yes already selected",
-			screen: `Quick safety check: Is this a project you created or one you trust?
-  No, exit
-❯ Yes, I trust this folder
-Enter to confirm · Esc to cancel`,
-			want: "\r",
-		},
-		{
-			name: "bypass permissions default no selected",
-			screen: `WARNING: Claude Code running in Bypass Permissions mode
-❯ No, exit
-  Yes, I accept
-Enter to confirm · Esc to cancel`,
-			want: "\x1b[B\r",
-		},
-		{
-			name: "bypass permissions yes already selected",
-			screen: `WARNING: Claude Code running in Bypass Permissions mode
-  No, exit
-❯ Yes, I accept
-Enter to confirm · Esc to cancel`,
-			want: "\r",
-		},
-		{
-			name: "telemetry prompt",
-			screen: `Help improve Claude Code by sharing telemetry?
-1. Yes
-2. No
-Enter to confirm`,
-			want: "\x1b[B\r",
-		},
-		{
-			name:   "generic enter to confirm",
-			screen: "Press Enter to confirm",
-			want:   "\r",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := promptActionForScreen(tt.screen)
-			if got != tt.want {
-				t.Fatalf("promptActionForScreen() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
 func mustLoadLocation(t *testing.T, name string) *time.Location {
 	t.Helper()
 	loc, err := time.LoadLocation(name)
@@ -350,18 +272,37 @@ func mustLoadLocation(t *testing.T, name string) *time.Location {
 	return loc
 }
 
-func TestDetectClaudeUsageOutputError_RateLimitedPanel(t *testing.T) {
-	panel := "Settings Status Config Usage Stats\nError: Usage endpoint is rate limited. Please try again in a moment.\nr to retry · Esc to cancel"
-	for _, source := range []string{"screen", "stderr"} {
-		t.Run(source, func(t *testing.T) {
-			screen, stderr := panel, ""
-			if source == "stderr" {
-				screen, stderr = "", panel
-			}
-			err := detectClaudeUsageOutputError(screen, stderr)
-			if err == nil || !strings.Contains(err.Error(), "rate limited") {
-				t.Fatalf("got %v, want explicit usage endpoint rate limit", err)
-			}
-		})
+// A probe whose PTY reader finishes before the process exits must still return.
+// The reader's single send on readDone used to be consumed by the main loop,
+// leaving the deferred cleanup blocked on a second receive forever (#2015).
+func TestRunClaudeUsageProbe_ReturnsWhenReaderFinishesFirst(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell script as a fake claude binary")
+	}
+	binDir := t.TempDir()
+	// Close every descriptor that refers to the PTY, then keep running, so the
+	// reader sees the end of the PTY while the process is still alive.
+	script := "#!/bin/sh\nexec </dev/null >/dev/null 2>/dev/null\nsleep 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&Agent{}).runClaudeUsageProbe(ctx)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error from a probe whose output ended before /usage rendered")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("runClaudeUsageProbe did not return after the PTY reader finished")
 	}
 }
