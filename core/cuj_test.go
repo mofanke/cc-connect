@@ -29,6 +29,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,10 +41,389 @@ import (
 	"time"
 )
 
+// CUJ: submit work during slow startup, queue a follow-up while the agent is
+// working, then check status. Both messages have receipts before either answer;
+// draining the queue must preserve each receipt without adding another one.
+func TestCUJ_A8_ImmediateReceiptsDuringStartupAndQueue(t *testing.T) {
+	env := newReceiptAckEnv(t, nil)
+
+	// User action 1: submit the first task while agent startup is blocked.
+	env.send("first", "first task", 1000)
+	env.awaitStartup()
+	env.assertReceipts("first")
+	close(env.startup.release)
+	env.awaitSendCount(1)
+
+	// User action 2: submit a follow-up while the first task awaits its result.
+	env.send("second", "follow-up task", 2000)
+	env.assertReceipts("first", "second")
+	env.awaitVisible(env.engine.i18n.T(MsgMessageQueued))
+
+	// User action 3: check status; local commands do not claim an agent turn.
+	env.send("status", "/status", 3000)
+	env.assertReceipts("first", "second")
+
+	env.startup.session.events <- Event{Type: EventResult, Content: "first answer", Done: true}
+	env.awaitVisible("first answer")
+	env.awaitSendCount(2)
+	env.assertReceipts("first", "second")
+	env.startup.session.events <- Event{Type: EventResult, Content: "second answer", Done: true}
+	env.awaitVisible("second answer")
+	env.assertReceipts("first", "second")
+}
+
+// psSupplementSession echoes the actual supplement while leaving the initial
+// task open. The engine still owns all command routing and turn completion.
+type psSupplementSession struct {
+	stubAgentSession
+	started chan struct{}
+	events  chan Event
+}
+
+func (s *psSupplementSession) Events() <-chan Event { return s.events }
+
+func (s *psSupplementSession) Send(prompt, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	if strings.Contains(prompt, "start held task") {
+		close(s.started)
+		return nil
+	}
+	s.events <- Event{Type: EventResult, Content: "supplement used: " + prompt, Done: true}
+	return nil
+}
+
+func TestCUJ_A9_PsAndBtwSupplementRunningTask(t *testing.T) {
+	for _, command := range []string{"/ps", "/btw"} {
+		t.Run(command, func(t *testing.T) {
+			p := &stubPlatformEngine{n: "test"}
+			s := &psSupplementSession{started: make(chan struct{}), events: make(chan Event, 1)}
+			e := NewEngine("test", &resultAgent{session: s}, []Platform{p}, "", LangEnglish)
+			t.Cleanup(func() {
+				if err := e.Stop(); err != nil {
+					t.Error(err)
+				}
+			})
+			const key = "test:ps-user"
+			send := func(content string) {
+				e.ReceiveMessage(p, &Message{SessionKey: key, Platform: p.Name(), UserID: "ps-user", Content: content, ReplyCtx: "ctx"})
+			}
+			waitFor := func(want string, idle bool) {
+				t.Helper()
+				deadline := time.NewTimer(2 * time.Second)
+				defer deadline.Stop()
+				ticker := time.NewTicker(5 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					for _, text := range p.getSent() {
+						if strings.Contains(text, want) && (!idle || !e.sessions.GetOrCreateActive(key).Busy()) {
+							return
+						}
+					}
+					select {
+					case <-ticker.C:
+					case <-deadline.C:
+						t.Fatalf("waiting for %q (idle=%v); visible replies: %v", want, idle, p.getSent())
+					}
+				}
+			}
+
+			// User action 1: start a task that remains in progress.
+			send("start held task")
+			select {
+			case <-s.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("initial task did not reach the agent")
+			}
+
+			// User action 2: supplement it through either command spelling.
+			send(command + " include unit tests")
+			waitFor(e.i18n.T(MsgPsSent), false)
+			waitFor("supplement used: include unit tests", true)
+
+			// User action 3: an idle session must reject another supplement.
+			send(command + " another instruction")
+			waitFor(e.i18n.T(MsgPsNoSession), true)
+		})
+	}
+}
+
+type ordinarySteerSession struct {
+	stubAgentSession
+	mu         sync.Mutex
+	active     bool
+	prompt     string
+	supplement string
+	started    chan string
+	events     chan Event
+}
+
+func (s *ordinarySteerSession) Events() <-chan Event { return s.events }
+func (s *ordinarySteerSession) Send(prompt, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	s.active = true
+	s.prompt = prompt
+	s.supplement = ""
+	s.mu.Unlock()
+	s.started <- prompt
+	return nil
+}
+func (s *ordinarySteerSession) SteerMessage(prompt, _ string, _ []ImageAttachment, _ []FileAttachment) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return false, nil
+	}
+	s.supplement = prompt
+	return true, nil
+}
+func (s *ordinarySteerSession) finish() {
+	s.mu.Lock()
+	s.active = false
+	text := "completed using: " + s.supplement + " for " + s.prompt
+	s.mu.Unlock()
+	s.events <- Event{Type: EventResult, Content: text, Done: true}
+}
+
+// Sub-case of A9: ordinary messages supplement the running task without /ps.
+func TestCUJ_A9_OrdinaryMessagesSteerAndPreserveHistory(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	s := &ordinarySteerSession{started: make(chan string, 4), events: make(chan Event, 4)}
+	e := NewEngine("ordinary-steer", &resultAgent{session: s}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	key := "test:chat:user"
+	send := func(text string) { e.ReceiveMessage(p, &Message{SessionKey: key, UserID: "user", Content: text}) }
+	waitStarted := func() {
+		t.Helper()
+		select {
+		case <-s.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("message did not start a turn")
+		}
+	}
+	waitVisible := func(text string) {
+		t.Helper()
+		deadline := time.After(2 * time.Second)
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			if strings.Contains(strings.Join(p.getSent(), "\n"), text) {
+				return
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("missing %q: %v", text, p.getSent())
+			case <-tick.C:
+			}
+		}
+	}
+	// Action 1: start a held turn. Action 2: supplement with ordinary input.
+	send("start task")
+	waitStarted()
+	send("include unit tests")
+	waitVisible(e.i18n.T(MsgMessageSteered))
+	s.finish()
+	waitVisible("completed using: include unit tests")
+	// Action 3: inspect history through the same platform entrypoint.
+	send("/history")
+	waitVisible("start task")
+	waitVisible("include unit tests")
+	// Action 4: an idle message starts a fresh turn and receives a result.
+	send("next task")
+	waitStarted()
+	s.finish()
+	waitVisible("for next task")
+}
+
+func TestCUJ_A9_OrdinaryMessageAtTurnEndIsDeliveredOnce(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	s := &ordinarySteerSession{started: make(chan string, 4), events: make(chan Event, 4)}
+	e := NewEngine("steer-end", &resultAgent{session: s}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	key := "test:chat:user"
+	send := func(text string) { e.ReceiveMessage(p, &Message{SessionKey: key, UserID: "user", Content: text}) }
+	waitStarted := func(want string) {
+		t.Helper()
+		select {
+		case got := <-s.started:
+			if got != want {
+				t.Fatalf("started %q, want %q", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("queued input did not start")
+		}
+	}
+	waitVisible := func(want string) {
+		t.Helper()
+		deadline := time.After(2 * time.Second)
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			if strings.Contains(strings.Join(p.getSent(), "\n"), want) {
+				return
+			}
+			select {
+			case <-tick.C:
+			case <-deadline:
+				t.Fatalf("missing %q: %v", want, p.getSent())
+			}
+		}
+	}
+	// Action 1 starts a turn. The backend ends it before notifying the engine.
+	send("first task")
+	waitStarted("first task")
+	s.mu.Lock()
+	s.active = false
+	s.mu.Unlock()
+	// Action 2 arrives in that window, so it must fall back to the queue.
+	send("late input")
+	waitVisible(e.i18n.T(MsgMessageQueued))
+	s.finish()
+	waitStarted("late input")
+	s.finish()
+	waitVisible("for late input")
+	// Action 3 exposes the retained message through history.
+	p.clearSent()
+	send("/history")
+	waitVisible("late input")
+	select {
+	case extra := <-s.started:
+		t.Fatalf("input replayed as %q", extra)
+	default:
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helper types: cujAgent + cujAgentSession give per-CUJ control over what the
 // agent "replies" for each user prompt, without bringing up a real LLM.
 // ---------------------------------------------------------------------------
+
+type liveConfigTestAgent struct {
+	stubModelModeAgent
+	session  *liveConfigTestSession
+	starts   int
+	startErr error
+}
+
+func (a *liveConfigTestAgent) SupportsSessionConfig() bool { return true }
+func (a *liveConfigTestAgent) StartSession(context.Context, string) (AgentSession, error) {
+	a.starts++
+	if a.startErr != nil {
+		return nil, a.startErr
+	}
+	return a.session, nil
+}
+
+func TestCUJ_M1_LiveConfigStartupFailureShowsCauseAndRecovers(t *testing.T) {
+	agent := &liveConfigTestAgent{startErr: errors.New("model metadata could not be resolved")}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("live-config-startup", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	for _, command := range []string{"/model", "/reasoning"} {
+		p.clearSent()
+		e.ReceiveMessage(p, &Message{SessionKey: "test:chat:user", UserID: "user", Content: command})
+		if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "model metadata could not be resolved") {
+			t.Fatalf("%s hid startup failure: %s", command, got)
+		}
+	}
+	agent.startErr = nil
+	agent.session = &liveConfigTestSession{options: []SessionConfigOption{
+		{ID: "model", Category: "model", Type: "select", CurrentValue: "a", Options: []SessionConfigValue{{Value: "a", Name: "Model A"}}},
+	}}
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{SessionKey: "test:chat:user", UserID: "user", Content: "/model"})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Model A") || strings.Contains(got, "metadata could not be resolved") {
+		t.Fatalf("model menu did not recover: %s", got)
+	}
+}
+
+type liveConfigTestSession struct {
+	stubAgentSession
+	options []SessionConfigOption
+	closed  bool
+	fail    bool
+}
+
+func (s *liveConfigTestSession) Close() error                                { s.closed = true; return nil }
+func (s *liveConfigTestSession) SessionConfigOptions() []SessionConfigOption { return s.options }
+func (s *liveConfigTestSession) SetSessionConfigOption(_ context.Context, id, value string) error {
+	if s.fail {
+		return errors.New("RPC rejected")
+	}
+	for i := range s.options {
+		if s.options[i].ID == id {
+			s.options[i].CurrentValue = value
+		}
+	}
+	return nil
+}
+
+func TestCUJ_M1_LiveConfigPreservesSessionAndHistory(t *testing.T) {
+	live := &liveConfigTestSession{options: []SessionConfigOption{
+		{ID: "model", Category: "model", Type: "select", CurrentValue: "a", Options: []SessionConfigValue{{Value: "a", Name: "Model A"}, {Value: "b", Name: "Model B"}}},
+		{ID: "reasoning_effort", Category: "thought_level", Type: "select", CurrentValue: "low", Options: []SessionConfigValue{{Value: "low", Name: "Low"}, {Value: "high", Name: "High"}}},
+	}}
+	agent := &liveConfigTestAgent{session: live}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("live-config", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	var savedModels []string
+	e.SetModelSaveFunc(func(model string) error {
+		savedModels = append(savedModels, model)
+		return nil
+	})
+	session := e.sessions.GetOrCreateActive("test:chat:user")
+	session.AddHistory("user", "keep this context")
+	for _, cmd := range []string{"/model", "/model b", "/reasoning high"} {
+		p.clearSent()
+		e.ReceiveMessage(p, &Message{SessionKey: "test:chat:user", UserID: "user", Content: cmd})
+		if len(p.getSent()) == 0 {
+			t.Fatalf("no reply for %s", cmd)
+		}
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "high") {
+		t.Fatalf("missing selected effort: %s", got)
+	}
+	card := e.handleCardNav("act:/model a", "test:chat:user")
+	if card == nil || !strings.Contains(card.RenderText(), "a") {
+		t.Fatal("model card action failed")
+	}
+	card = e.handleCardNav("act:/reasoning low", "test:chat:user")
+	if card == nil || !strings.Contains(card.RenderText(), "low") {
+		t.Fatal("reasoning card action failed")
+	}
+	live.fail = true
+	card = e.handleCardNav("act:/model b", "test:chat:user")
+	if !strings.Contains(card.RenderText(), "RPC rejected") || live.options[0].CurrentValue != "a" {
+		t.Fatal("failed RPC changed selection or hid error")
+	}
+	live.fail = false
+	card = e.handleCardNav("act:/reasoning invalid", "test:chat:user")
+	if !strings.Contains(card.RenderText(), "Unsupported selection") {
+		t.Fatal("invalid selection accepted")
+	}
+	lockGen, locked := session.TryLock()
+	if !locked {
+		t.Fatal("session remained busy after command")
+	}
+	card = e.handleCardNav("act:/model b", "test:chat:user")
+	session.UnlockWithoutUpdate(lockGen)
+	if !strings.Contains(card.RenderText(), "busy") {
+		t.Fatal("busy session not protected")
+	}
+	card = e.handleCardNav("act:/model b", "test:chat:user")
+	if card == nil || !strings.Contains(card.RenderText(), "b") {
+		t.Fatal("model did not recover after busy session")
+	}
+	if agent.starts != 1 || live.closed || session.GetAgentSessionID() != "stub-session" {
+		t.Fatalf("session restarted: starts=%d closed=%v", agent.starts, live.closed)
+	}
+	if history := session.GetHistory(0); len(history) != 1 || history[0].Content != "keep this context" {
+		t.Fatalf("history lost: %#v", history)
+	}
+	if agent.GetModel() != "b" || agent.GetReasoningEffort() != "low" {
+		t.Fatalf("agent defaults not synchronized: model=%q reasoning=%q", agent.GetModel(), agent.GetReasoningEffort())
+	}
+	if got := strings.Join(savedModels, ","); got != "b,a,b" {
+		t.Fatalf("saved models = %q, want successful live selections", got)
+	}
+}
 
 // cujAgent is a controllable Agent that returns a configurable AgentSession
 // per StartSession call. Tests can mutate cujAgentSession.reply between
@@ -127,6 +507,7 @@ type cujAgentSession struct {
 
 	// observed
 	sentPrompts []string
+	sentImages  [][]ImageAttachment
 	closeCount  int
 }
 
@@ -147,9 +528,10 @@ func newCUJAgentSession() *cujAgentSession {
 	}
 }
 
-func (s *cujAgentSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *cujAgentSession) Send(prompt string, _ string, images []ImageAttachment, _ []FileAttachment) error {
 	s.mu.Lock()
 	s.sentPrompts = append(s.sentPrompts, prompt)
+	s.sentImages = append(s.sentImages, cloneCUJImages(images))
 	reply := s.reply
 	delay := s.delayMs
 	override := s.nextEventOverride
@@ -208,6 +590,27 @@ func (s *cujAgentSession) getSentPrompts() []string {
 	defer s.mu.Unlock()
 	out := make([]string, len(s.sentPrompts))
 	copy(out, s.sentPrompts)
+	return out
+}
+
+// Copy attachment bytes as well as the slice so observations remain independent
+// of later caller mutations and can be read safely while the session is running.
+func cloneCUJImages(images []ImageAttachment) []ImageAttachment {
+	out := make([]ImageAttachment, len(images))
+	for i, image := range images {
+		out[i] = image
+		out[i].Data = append([]byte(nil), image.Data...)
+	}
+	return out
+}
+
+func (s *cujAgentSession) getSentImages() [][]ImageAttachment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([][]ImageAttachment, len(s.sentImages))
+	for i, images := range s.sentImages {
+		out[i] = cloneCUJImages(images)
+	}
 	return out
 }
 
@@ -1120,36 +1523,60 @@ func TestCUJ_A2_MultiTurnAgentReceivesHistory(t *testing.T) {
 	}
 }
 
-// CUJ-A3 · User uploads image → engine routes it to the agent.
-// (No real vision LLM; we assert the image attachment reaches the agent.)
+// CUJ-A3 · User sends text with an image, an image alone, then text alone.
+// Each turn receives a reply, and only that turn's images reach the agent.
 func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
-	plat := &stubPlatformEngine{n: "test"}
-	agent := &cujAgent{}
-	dir := t.TempDir()
-	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
-
-	msg := &Message{
-		SessionKey: "test:img", Platform: "test", MessageID: "img1",
-		UserID: "img", UserName: "img",
-		Content:  "what is in this image",
-		Images:   []ImageAttachment{{MimeType: "image/png", Data: []byte("\x89PNG fake"), FileName: "chart.png"}},
-		ReplyCtx: "ctx",
+	env := newCUJEnv(t)
+	t.Cleanup(func() { _ = env.engine.Stop() })
+	turns := []struct {
+		content string
+		images  []ImageAttachment
+	}{
+		{
+			content: "what is in this image",
+			images:  []ImageAttachment{{MimeType: "image/png", Data: []byte("\x89PNG chart"), FileName: "chart.png"}},
+		},
+		{
+			images: []ImageAttachment{{MimeType: "image/jpeg", Data: []byte("\xff\xd8 screenshot"), FileName: "screenshot.jpg"}},
+		},
+		{content: "thanks, no new image this time"},
 	}
-	e.ReceiveMessage(plat, msg)
+	for i, turn := range turns {
+		env.engine.ReceiveMessage(env.plat, &Message{
+			SessionKey: "test:img", Platform: "test", MessageID: fmt.Sprintf("img%d", i+1),
+			UserID: "img", UserName: "img", Content: turn.content,
+			Images: turn.images, ReplyCtx: "ctx",
+		})
+		env.waitFor(fmt.Sprintf("reply to image journey turn %d", i+1), 2*time.Second, func() bool {
+			count := 0
+			for _, reply := range env.plat.getSent() {
+				if reply == "ok" {
+					count++
+				}
+			}
+			return count >= i+1
+		})
 
-	deadline := time.After(2 * time.Second)
-	for {
-		agent.mu.Lock()
-		n := len(agent.sessions)
-		agent.mu.Unlock()
-		if n > 0 {
-			break
+		env.agent.mu.Lock()
+		if len(env.agent.sessions) != 1 {
+			n := len(env.agent.sessions)
+			env.agent.mu.Unlock()
+			t.Fatalf("turn %d: agent sessions = %d, want one continued session", i+1, n)
 		}
-		select {
-		case <-deadline:
-			t.Fatal("agent never received the message with image")
-		default:
-			time.Sleep(10 * time.Millisecond)
+		sess := env.agent.sessions[0]
+		env.agent.mu.Unlock()
+		sent := sess.getSentImages()
+		if len(sent) != i+1 {
+			t.Fatalf("turn %d: agent received %d sends, want %d", i+1, len(sent), i+1)
+		}
+		got := sent[i]
+		if len(got) != len(turn.images) {
+			t.Fatalf("turn %d: agent received %d images, want %d", i+1, len(got), len(turn.images))
+		}
+		for j, want := range turn.images {
+			if got[j].MimeType != want.MimeType || got[j].FileName != want.FileName || !bytes.Equal(got[j].Data, want.Data) {
+				t.Fatalf("turn %d image %d: got %#v, want %#v", i+1, j+1, got[j], want)
+			}
 		}
 	}
 }
@@ -1368,7 +1795,7 @@ func TestCUJ_B8_HistoryShowsConversation(t *testing.T) {
 // a fresh session (already covered by TestHandleMessage_AutoResetOnIdle in
 // engine_test.go; we add a thin CUJ-level link).
 func TestCUJ_B10_ResetOnIdle_LinkedToEngineTest(t *testing.T) {
-	t.Log("CUJ-B10: see TestHandleMessage_AutoResetOnIdle_RotatesToNewSession in engine_test.go — full behavior already locked down")
+	t.Log("CUJ-B10: see TestHandleMessage_AutoResetOnIdle_RotatesToNewSession in engine_test.go and TestHandleMessage_QueuedUserMessageRefreshesIdleTimer in idle_reset_queue_test.go — full behavior already locked down")
 }
 
 // CUJ-B11 · Same user in private chat vs group chat: sessions isolated.
@@ -1867,6 +2294,11 @@ func TestCUJ_G4_AgentCrashReturnsErrorAndRecovers(t *testing.T) {
 // reaches the user's screen.
 func TestCUJ_G5_ToolFailureSurfacesToUser(t *testing.T) {
 	env := newCUJEnv(t)
+	t.Cleanup(func() {
+		if err := env.engine.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	// Establish a session.
 	env.userSends("g5", "hello")
@@ -1900,6 +2332,29 @@ func TestCUJ_G5_ToolFailureSurfacesToUser(t *testing.T) {
 	if !env.sentContains("permission denied") && !env.sentContains("bash tool exited") {
 		t.Fatalf("user did not see the underlying tool error in reply; got: %v", env.plat.getSent())
 	}
+
+	// A failed turn does not stop a persistent agent's background work.
+	// Deliver its result without asking the user to send "continue".
+	env.waitFor("failed foreground turn released", 2*time.Second, func() bool {
+		return !env.activeSession("test:g5").Busy()
+	})
+	sess.events <- Event{Type: EventText, Content: "background task finished"}
+	sess.events <- Event{Type: EventResult, Done: true}
+	env.waitFor("background result after failed turn", 2*time.Second, func() bool {
+		return env.sentContains("background task finished")
+	})
+	if got := len(sess.getSentPrompts()); got != 2 {
+		t.Fatalf("failed prompt was retried: sent %d prompts, want 2", got)
+	}
+
+	// A new user turn must take ownership from the background reader.
+	sess.mu.Lock()
+	sess.reply = "follow-up answer"
+	sess.mu.Unlock()
+	env.userSends("g5", "what happened next?")
+	env.waitFor("follow-up answer after failed turn", 2*time.Second, func() bool {
+		return env.sentContains("follow-up answer") && !env.activeSession("test:g5").Busy()
+	})
 }
 
 // CUJ-G6 · Network flap: undelivered outbound messages eventually arrive
@@ -1907,6 +2362,57 @@ func TestCUJ_G5_ToolFailureSurfacesToUser(t *testing.T) {
 // platform/feishu/token_retry_test.go and transient_retry_test.go.
 func TestCUJ_G6_NetworkFlapLinkedToPlatformLayer(t *testing.T) {
 	t.Log("CUJ-G6: covered by platform/feishu/{token_retry,transient_retry}_test.go")
+	t.Run("progress_card_recovers_and_followups_still_work", func(t *testing.T) {
+		p := &recoveringEngineProgressPlatform{
+			stubCompactProgressPlatform: stubCompactProgressPlatform{
+				stubPlatformEngine: stubPlatformEngine{n: "test"},
+				style:              "card", supportPayload: true,
+			},
+			remainingFailures: 1,
+		}
+		agent := &cujAgent{}
+		engine := NewEngine("recovery", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+		t.Cleanup(func() { _ = engine.Stop() })
+		env := &cujEnv{t: t, engine: engine, plat: &p.stubPlatformEngine, agent: agent}
+		const key = "test:card-recovery"
+		// Three user turns: recover an interrupted card, then continue twice.
+		for i := range 3 {
+			answer := fmt.Sprintf("answer %d", i)
+			events := []Event{
+				{Type: EventThinking, Content: "planning"},
+				{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"},
+				{Type: EventToolResult, ToolName: "Bash", ToolResult: "hi"},
+				{Type: EventResult, Content: answer, Done: true},
+			}
+			if i == 0 {
+				agent.setNextSessionEvents(events, 0)
+			} else {
+				agent.mu.Lock()
+				session := agent.sessions[len(agent.sessions)-1]
+				agent.mu.Unlock()
+				session.mu.Lock()
+				session.pendingEvents = events
+				session.mu.Unlock()
+			}
+			engine.ReceiveMessage(p, &Message{
+				SessionKey: key, Platform: p.Name(), UserID: "reader", ReplyCtx: "ctx",
+				MessageID: fmt.Sprintf("recovery-%d", i), Content: fmt.Sprintf("task %d", i),
+			})
+			env.waitFor("final answer", 2*time.Second, func() bool { return env.sentContains(answer) })
+			env.waitFor("turn finished", 2*time.Second, func() bool { return !engine.sessions.GetOrCreateActive(key).Busy() })
+			if sent := p.getSent(); len(sent) != i+1 {
+				t.Fatalf("sent = %#v, want only one final answer per turn", sent)
+			}
+			if len(p.getPreviewStarts()) != i+1 {
+				t.Fatal("each turn should use exactly one progress card")
+			}
+			edits := p.getPreviewEdits()
+			payload, ok := ParseProgressCardPayload(edits[len(edits)-1])
+			if !ok || payload.State != ProgressCardStateCompleted {
+				t.Fatalf("card did not recover to completed: %#v", payload)
+			}
+		}
+	})
 }
 
 // ===========================================================================
@@ -1949,6 +2455,47 @@ func TestCUJ_I3_DisplayModesLinkedToIntegration(t *testing.T) {
 // for the next message.
 func TestCUJ_I4_StreamingToggleLinkedToIntegration(t *testing.T) {
 	t.Log("CUJ-I4: covered by release-gate TestCC_STREAM_01_off + TestCC_STREAM_02_on + core/streaming_test.go (14 unit tests)")
+}
+
+type referenceRenderCUJAgent struct{ *cujAgent }
+
+func (a *referenceRenderCUJAgent) Name() string { return "codex" }
+
+// CUJ-I5: across three replies, local files remain distinct, report values
+// remain readable, and the user can copy commands and web links unchanged.
+func TestCUJ_I5_LocalReferencesPreserveReplyContent(t *testing.T) {
+	platform := &stubPlatformEngine{n: "feishu"}
+	agent := &referenceRenderCUJAgent{cujAgent: &cujAgent{}}
+	engine := NewEngine("references", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(func() { _ = engine.Stop() })
+	engine.SetReferenceConfig(ReferenceRenderCfg{
+		NormalizeAgents: []string{"codex"}, RenderPlatforms: []string{"feishu"},
+		DisplayPath: "basename", MarkerStyle: "emoji", EnclosureStyle: "code",
+	})
+	env := &cujEnv{t: t, engine: engine, plat: platform, agent: agent.cujAgent}
+	replies := []struct{ input, want string }{
+		{"`a.go` b.go c.go", "📄 `a.go` 📄 `b.go` 📄 `c.go`"},
+		{"参考 `report.md`: 23.34 9/28 170,851.78", "参考 📄 `report.md`: 23.34 9/28 170,851.78"},
+		{"Run `/new investigate` then https://example.com/one https://example.com/two", "Run `/new investigate` then https://example.com/one https://example.com/two"},
+	}
+	for i, reply := range replies {
+		if i == 0 {
+			agent.setNextSessionEvents([]Event{{Type: EventResult, Content: reply.input, Done: true}}, 0)
+		} else {
+			agent.mu.Lock()
+			session := agent.sessions[len(agent.sessions)-1]
+			agent.mu.Unlock()
+			session.mu.Lock()
+			session.reply = reply.input
+			session.mu.Unlock()
+		}
+		engine.ReceiveMessage(platform, &Message{
+			SessionKey: "feishu:reader", Platform: "feishu", UserID: "reader", ReplyCtx: "reader",
+			MessageID: fmt.Sprintf("reference-%d", i), Content: fmt.Sprintf("question %d", i),
+		})
+		env.waitFor("reference reply", 2*time.Second, func() bool { return env.sentContains(reply.want) })
+		env.waitFor("turn finished", 2*time.Second, func() bool { return !engine.sessions.GetOrCreateActive("feishu:reader").Busy() })
+	}
 }
 
 // ===========================================================================
@@ -2411,4 +2958,115 @@ func TestCUJ_H4_FeishuTopicsKeepWorkspaceBindingsIsolated(t *testing.T) {
 	if got := lastReply(); !strings.Contains(got, normalizeWorkspacePath(workspaceB)) {
 		t.Fatalf("topic B changed after topic A unbind: %q", got)
 	}
+}
+
+// Lists and invocation must agree across groups, including after rebinding.
+func TestCUJ_H5_WorkspaceSkillDiscoveryAndInvocation(t *testing.T) {
+	t.Run("EnabledCatalogExcludesUnselectedSkills", func(t *testing.T) {
+		p := &stubPlatformEngine{n: "feishu"}
+		e, a := newCatalogSkillsEngine(t, p)
+		e.ReceiveMessage(p, skillMessage(p.Name(), "a", "/skills"))
+		sent := p.getSent()
+		text := sent[len(sent)-1]
+		if !strings.Contains(text, "/plugin:enabled") || strings.Contains(text, "disabled-sibling") || strings.Contains(text, "claude-only") || strings.Contains(text, "cached-only") {
+			t.Fatalf("incorrect native catalog: %s", text)
+		}
+		before := len(sent)
+		e.ReceiveMessage(p, skillMessage(p.Name(), "a", "/plugin:enabled"))
+		env := &cujEnv{t: t, engine: e, plat: p}
+		env.waitFor("native skill response", 3*time.Second, func() bool {
+			for _, text := range p.getSent()[before:] {
+				if strings.Contains(text, "Native selected instructions") {
+					return true
+				}
+			}
+			return false
+		})
+		// Simulate disabling/removing the skill in the agent's native manager.
+		a.catalog = nil
+		e.ReceiveMessage(p, skillMessage(p.Name(), "a", "/skills"))
+		sent = p.getSent()
+		if text := sent[len(sent)-1]; !strings.Contains(text, e.i18n.T(MsgSkillsEmpty)) {
+			t.Fatalf("disabled skill still listed: %s", text)
+		}
+	})
+	p := &stubPlatformEngine{n: "feishu"}
+	e, a, b := newWorkspaceSkillsEngine(t, p)
+	for _, channel := range []string{"a", "b"} {
+		e.ReceiveMessage(p, skillMessage(p.Name(), channel, "/skills"))
+		sent := p.getSent()
+		other := "a"
+		if channel == "a" {
+			other = "b"
+		}
+		assertWorkspaceSkills(t, sent[len(sent)-1], channel, other)
+	}
+	for channel, ws := range map[string]string{"a": a, "b": b} {
+		before := len(p.getSent())
+		e.ReceiveMessage(p, skillMessage(p.Name(), channel, "/SHARED_SKILL"))
+		env := &cujEnv{t: t, engine: e, plat: p}
+		env.waitFor("workspace skill response", 3*time.Second, func() bool {
+			for _, text := range p.getSent()[before:] {
+				if strings.Contains(text, "Executed in "+ws) && strings.Contains(text, "Instructions "+channel) {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	e.ReceiveMessage(p, skillMessage(p.Name(), "a", "/workspace bind b"))
+	e.ReceiveMessage(p, skillMessage(p.Name(), "a", "/skills"))
+	sent := p.getSent()
+	assertWorkspaceSkills(t, sent[len(sent)-1], "b", "a")
+}
+
+// Opening, changing, and reopening reasoning controls must stay in the
+// workspace selected by the platform session, including card callbacks.
+func TestCUJ_R1_ReasoningCardsPreserveWorkspaceIsolation(t *testing.T) {
+	p := &reasoningJourneyPlatform{stubCardPlatform: stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
+	global := &workspaceEffortAgent{levels: []string{"global"}, effort: "global"}
+	e := NewEngine("test", global, []Platform{p}, "", LangEnglish)
+	e.SetMultiWorkspace(t.TempDir(), filepath.Join(t.TempDir(), "bindings.json"))
+	dir := normalizeWorkspacePath(t.TempDir())
+	e.workspaceBindings.Bind("project:test", "C-journey", "chan", dir)
+	ws := e.workspacePool.GetOrCreate(dir)
+	ws.agent = &workspaceEffortAgent{levels: []string{"off", "high"}}
+	ws.sessions = NewSessionManager("")
+	e.onPlatformReady(p)
+	key := "feishu:C-journey:u1"
+	send := func(content string) {
+		e.ReceiveMessage(p, &Message{SessionKey: key, Content: content, ReplyCtx: "ctx", UserID: "u1"})
+	}
+	assertCard := func(card *Card, want string) {
+		t.Helper()
+		got := fmt.Sprintf("%+v", card.Elements)
+		if !strings.Contains(got, want) || strings.Contains(got, "global") {
+			t.Fatalf("card = %s; want %s without global effort", got, want)
+		}
+	}
+	// Action 1: open the workspace's controls through the message entrypoint.
+	send("/reasoning")
+	if len(p.repliedCards) != 1 {
+		t.Fatalf("expected card, got %d", len(p.repliedCards))
+	}
+	assertCard(p.repliedCards[0], "off|high")
+	// Action 2: choose high through the platform's registered callback.
+	if p.navigation == nil {
+		t.Fatal("card callback not registered")
+	}
+	assertCard(p.navigation("act:/reasoning 2", key), e.i18n.Tf(MsgReasoningCurrent, "high"))
+	// Action 3: navigate back to the controls.
+	assertCard(p.navigation("nav:/reasoning", key), e.i18n.Tf(MsgReasoningCurrent, "high"))
+	// Action 4: reopen from a message; persisted selection remains visible.
+	send("/reasoning")
+	assertCard(p.repliedCards[len(p.repliedCards)-1], e.i18n.Tf(MsgReasoningCurrent, "high"))
+}
+
+type reasoningJourneyPlatform struct {
+	stubCardPlatform
+	navigation CardNavigationHandler
+}
+
+func (p *reasoningJourneyPlatform) SetCardNavigationHandler(h CardNavigationHandler) {
+	p.navigation = h
 }

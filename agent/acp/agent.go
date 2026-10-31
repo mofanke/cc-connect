@@ -2,14 +2,17 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/chenhg5/cc-connect/agent/kimi"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -19,15 +22,18 @@ func init() {
 
 // Agent runs an ACP (Agent Client Protocol) agent subprocess over stdio JSON-RPC.
 type Agent struct {
-	workDir      string
-	cmd          string
-	cliExtraArgs []string // extra args from cmd, prepended before args
-	args         []string
-	staticEnv    map[string]string
-	extraEnv     []string
-	sessionEnv   []string
-	authMethod   string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
-	displayName  string // optional, for doctor (default "ACP")
+	workDir         string
+	cmd             string
+	cliExtraArgs    []string // extra args from cmd, prepended before args
+	args            []string
+	staticEnv       map[string]string
+	extraEnv        []string
+	sessionEnv      []string
+	authMethod      string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
+	displayName     string // optional, for doctor (default "ACP")
+	model           string // optional, for Trae CLI ACP only
+	reasoningEffort string
+	traeHome        string // optional TRAE_HOME override for Trae CLI
 
 	// mode is the pending permission mode to apply to new sessions.
 	// When set, StartSession applies it via session/set_mode right after
@@ -45,9 +51,9 @@ type Agent struct {
 	// handshake so that future PermissionModes() calls can reflect the
 	// actual modes this specific ACP agent offers (rather than a
 	// hard-coded fallback that may not match).
-	modesMu       sync.RWMutex
-	modesCache    []core.PermissionModeInfo
-	modesCurrent  string
+	modesMu      sync.RWMutex
+	modesCache   []core.PermissionModeInfo
+	modesCurrent string
 
 	mu sync.RWMutex
 }
@@ -67,7 +73,7 @@ var _ sessionCallbacks = (*Agent)(nil)
 // New builds an acp agent from project options.
 // Required: options["command"] — executable name or path for the ACP agent.
 // Optional: options["args"], options["env"], options["auth_method"],
-// options["display_name"], options["mode"].
+// options["display_name"], options["mode"], options["trae_home"].
 func New(opts map[string]any) (core.Agent, error) {
 	workDir, _ := opts["work_dir"].(string)
 	if workDir == "" {
@@ -93,18 +99,30 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 	mode, _ := opts["mode"].(string)
 	mode = strings.TrimSpace(mode)
+	model, _ := opts["model"].(string)
+	model = strings.TrimSpace(model)
+	effort, _ := opts["reasoning_effort"].(string)
+	traeHome, _ := opts["trae_home"].(string)
+	traeHome = strings.TrimSpace(traeHome)
 
-	return &Agent{
-		workDir:     workDir,
-		cmd:          cmdStr,
-		cliExtraArgs: cliExtraArgs,
-		args:        args,
-		staticEnv:   staticEnv,
-		extraEnv:    extra,
-		authMethod:  authMethod,
-		displayName: displayName,
-		mode:        mode,
-	}, nil
+	agent := &Agent{
+		workDir:         workDir,
+		cmd:             cmdStr,
+		cliExtraArgs:    cliExtraArgs,
+		args:            args,
+		staticEnv:       staticEnv,
+		extraEnv:        extra,
+		authMethod:      authMethod,
+		displayName:     displayName,
+		mode:            mode,
+		model:           model,
+		reasoningEffort: normalizeTraeReasoningEffort(effort),
+		traeHome:        traeHome,
+	}
+	if isTraeCLICommand(cmdStr) {
+		return &TraeAgent{Agent: agent}, nil
+	}
+	return agent, nil
 }
 
 func envMapFromOpts(opts map[string]any) map[string]string {
@@ -213,6 +231,15 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.displayName != "" {
 		opts["display_name"] = a.displayName
 	}
+	if a.model != "" {
+		opts["model"] = a.model
+	}
+	if a.reasoningEffort != "" {
+		opts["reasoning_effort"] = a.reasoningEffort
+	}
+	if a.traeHome != "" {
+		opts["trae_home"] = a.traeHome
+	}
 	return opts
 }
 
@@ -225,12 +252,15 @@ func (a *Agent) SetSessionEnv(env []string) {
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.RLock()
 	command := a.cmd
-	allArgs := append(append([]string{}, a.cliExtraArgs...), a.args...)
+	allArgs := a.sessionArgsLocked()
 	workDir := a.workDir
 	authMethod := a.authMethod
 	pendingMode := a.mode
 	extra := append([]string(nil), a.extraEnv...)
 	extra = append(extra, a.sessionEnv...)
+	if isTraeCLICommand(command) && a.traeHome != "" {
+		extra = append(extra, "TRAE_HOME="+a.traeHome)
+	}
 	a.mu.RUnlock()
 
 	return newACPSession(ctx, acpSessionConfig{
@@ -246,6 +276,167 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 }
 
 func (a *Agent) Stop() error { return nil }
+
+// TraeAgent exposes live session configuration and CLI defaults for new sessions.
+type TraeAgent struct {
+	*Agent
+}
+
+func (a *TraeAgent) SupportsSessionConfig() bool { return true }
+
+func (a *TraeAgent) SetModel(model string) {
+	model = strings.TrimSpace(model)
+	a.mu.Lock()
+	a.model = model
+	a.mu.Unlock()
+	slog.Info("acp: Trae CLI model changed for future sessions", "model", model)
+}
+
+func (a *TraeAgent) GetModel() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.model
+}
+
+func (a *TraeAgent) AvailableModels(ctx context.Context) []core.ModelOption {
+	a.mu.RLock()
+	cmd := a.cmd
+	extra := append([]string(nil), a.extraEnv...)
+	extra = append(extra, a.sessionEnv...)
+	workDir := a.workDir
+	a.mu.RUnlock()
+	return fetchTraeModels(ctx, cmd, workDir, extra)
+}
+
+func (a *Agent) sessionArgsLocked() []string {
+	args := append(append([]string{}, a.cliExtraArgs...), a.args...)
+	if isTraeCLICommand(a.cmd) {
+		if a.reasoningEffort != "" {
+			args = append([]string{"-c", fmt.Sprintf("model_reasoning_effort=%q", a.reasoningEffort)}, args...)
+		}
+		if a.model != "" {
+			args = append([]string{"-c", fmt.Sprintf("model=%q", a.model)}, args...)
+		}
+	}
+	return args
+}
+
+func (a *TraeAgent) SetReasoningEffort(effort string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reasoningEffort = normalizeTraeReasoningEffort(effort)
+}
+
+func (a *TraeAgent) GetReasoningEffort() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.reasoningEffort
+}
+
+func (a *TraeAgent) AvailableReasoningEfforts() []string {
+	return []string{"low", "medium", "high", "xhigh"}
+}
+
+func normalizeTraeReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return "low"
+	case "medium", "med":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh", "x-high", "very-high":
+		return "xhigh"
+	default:
+		return ""
+	}
+}
+
+func isTraeCLICommand(cmd string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(cmd)))
+	return base == "traecli" || base == "traex"
+}
+
+type traeModelJSON struct {
+	Name        string `json:"name"`
+	RealName    string `json:"real_name"`
+	Description string `json:"description"`
+}
+
+func fetchTraeModels(ctx context.Context, cmd, workDir string, extraEnv []string) []core.ModelOption {
+	c := exec.CommandContext(ctx, cmd, "models", "--json")
+	c.Dir = workDir
+	c.Env = core.MergeEnv(os.Environ(), extraEnv)
+	out, err := c.Output()
+	if err != nil {
+		slog.Debug("acp: Trae CLI models failed", "error", err)
+		return nil
+	}
+	var raw []traeModelJSON
+	if err := json.Unmarshal(out, &raw); err != nil {
+		slog.Debug("acp: parse Trae CLI models failed", "error", err)
+		return parseTraeModelLines(string(out))
+	}
+	models := make([]core.ModelOption, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, m := range raw {
+		name := strings.TrimSpace(m.Name)
+		if name == "" {
+			name = strings.TrimSpace(m.RealName)
+		}
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		desc := strings.TrimSpace(m.Description)
+		if real := strings.TrimSpace(m.RealName); real != "" && !strings.EqualFold(real, name) {
+			if desc != "" {
+				desc = real + " — " + desc
+			} else {
+				desc = real
+			}
+		}
+		models = append(models, core.ModelOption{Name: name, Desc: desc})
+	}
+	return models
+}
+
+func parseTraeModelLines(out string) []core.ModelOption {
+	var models []core.ModelOption
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(out, "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" || strings.HasPrefix(name, "WARNING:") {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		models = append(models, core.ModelOption{Name: name})
+	}
+	return models
+}
+
+// GetSessionHistory implements core.HistoryProvider. ACP itself defines no
+// history retrieval RPC, but backends like Kimi Code CLI (`kimi acp`) persist
+// transcripts locally; read them so /last and /history work after /switch.
+// For non-Kimi backends this reports "session not found", which the engine
+// surfaces as an ordinary lookup failure.
+func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
+	a.mu.RLock()
+	extra := append([]string(nil), a.extraEnv...)
+	extra = append(extra, a.sessionEnv...)
+	a.mu.RUnlock()
+	return kimi.ReadSessionHistory(sessionID, limit, extra...)
+}
+
+var _ core.HistoryProvider = (*Agent)(nil)
 
 // -- AgentDoctorInfo --
 

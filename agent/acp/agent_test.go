@@ -1,10 +1,72 @@
 package acp
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/chenhg5/cc-connect/core"
 )
+
+// fakeTraeCLIOnPath creates a stub "traecli" executable in a temp dir and
+// prepends that dir to PATH for the duration of the test. New() only needs the
+// command to be resolvable via exec.LookPath (and named "traecli"/"traex") to
+// construct a *TraeAgent; the stub is never actually run by these unit tests.
+func fakeTraeCLIOnPath(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI stub uses a POSIX shebang; skip on Windows")
+	}
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "traecli")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestTraeReasoningEffortAndSessionArgs(t *testing.T) {
+	fakeTraeCLIOnPath(t)
+	a, err := New(map[string]any{"cmd": "traecli", "args": []string{"acp", "serve"}, "model": "GPT-5.6-Sol", "reasoning_effort": " HIGH "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, ok := a.(core.ReasoningEffortSwitcher)
+	if !ok {
+		t.Fatal("Trae CLI missing reasoning interface")
+	}
+	if rs.GetReasoningEffort() != "high" || !reflect.DeepEqual(rs.AvailableReasoningEfforts(), []string{"low", "medium", "high", "xhigh"}) {
+		t.Fatal("unexpected reasoning options")
+	}
+	for input, want := range map[string]string{"low": "low", "med": "medium", "high": "high", "x-high": "xhigh", "bogus": "", "": ""} {
+		rs.SetReasoningEffort(input)
+		if got := rs.GetReasoningEffort(); got != want {
+			t.Fatalf("effort(%q) = %q, want %q", input, got, want)
+		}
+	}
+	rs.SetReasoningEffort("x-high")
+	copyAgent, err := New(a.(core.WorkspaceAgentOptionSnapshotter).WorkspaceAgentOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := copyAgent.(*TraeAgent).sessionArgsLocked()
+	want := []string{"-c", `model="GPT-5.6-Sol"`, "-c", `model_reasoning_effort="xhigh"`, "acp", "serve"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+	generic, err := New(map[string]any{"cmd": os.Args[0], "args": []string{"serve"}, "model": "ignored", "reasoning_effort": "high"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := generic.(core.ReasoningEffortSwitcher); ok {
+		t.Fatal("generic ACP must not expose reasoning")
+	}
+	if got := generic.(*Agent).sessionArgsLocked(); !reflect.DeepEqual(got, []string{"serve"}) {
+		t.Fatalf("generic args changed: %#v", got)
+	}
+}
 
 func TestNew_DisplayNameDefault(t *testing.T) {
 	a, err := New(map[string]any{"command": "true"})
@@ -38,6 +100,7 @@ func TestWorkspaceAgentOptions(t *testing.T) {
 		"env":          map[string]any{"FOO": "bar", "COPILOT_VALUE": "a=b"},
 		"auth_method":  "cursor_login",
 		"display_name": "Copilot ACP",
+		"trae_home":    "/tmp/ignored-for-generic-acp",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -68,5 +131,54 @@ func TestWorkspaceAgentOptions(t *testing.T) {
 	}
 	if got, _ := opts["display_name"].(string); got != "Copilot ACP" {
 		t.Fatalf("display_name = %q, want Copilot ACP", got)
+	}
+	if got, _ := opts["trae_home"].(string); got != "/tmp/ignored-for-generic-acp" {
+		t.Fatalf("trae_home = %q, want preserved option", got)
+	}
+}
+
+func TestNew_TraeCLIImplementsModelSwitcher(t *testing.T) {
+	fakeTraeCLIOnPath(t)
+	a, err := New(map[string]any{
+		"command": "traecli",
+		"args":    []any{"acp", "serve"},
+		"model":   "test-model-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := a.(*TraeAgent); !ok {
+		t.Fatalf("New(traecli) returned %T, want *TraeAgent", a)
+	}
+	switcher, ok := a.(core.ModelSwitcher)
+	if !ok {
+		t.Fatalf("TraeAgent does not implement ModelSwitcher")
+	}
+	if got := switcher.GetModel(); got != "test-model-a" {
+		t.Fatalf("GetModel = %q, want test-model-a", got)
+	}
+	switcher.SetModel("test-model-b")
+	if got := switcher.GetModel(); got != "test-model-b" {
+		t.Fatalf("GetModel after SetModel = %q, want test-model-b", got)
+	}
+	opts := a.(core.WorkspaceAgentOptionSnapshotter).WorkspaceAgentOptions()
+	if got, _ := opts["model"].(string); got != "test-model-b" {
+		t.Fatalf("snapshot model = %q, want test-model-b", got)
+	}
+}
+
+func TestNew_GenericACPDoesNotImplementModelSwitcher(t *testing.T) {
+	a, err := New(map[string]any{
+		"command": "true",
+		"args":    []any{"acp", "serve"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := a.(*Agent); !ok {
+		t.Fatalf("New(true) returned %T, want *Agent", a)
+	}
+	if _, ok := a.(core.ModelSwitcher); ok {
+		t.Fatalf("generic ACP agent unexpectedly implements ModelSwitcher")
 	}
 }

@@ -6,8 +6,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 )
+
+func TestRPCError_PreservesModelMetadataFailure(t *testing.T) {
+	var payload rpcErrPayload
+	if err := json.Unmarshal([]byte(`{"code":-32603,"message":"Internal error","data":"model metadata could not be resolved"}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := payload.Error(); !strings.Contains(got, "model metadata could not be resolved") {
+		t.Fatalf("RPC detail lost: %s", got)
+	}
+}
 
 func TestTransportCallRoundTrip(t *testing.T) {
 	rResp, wMockResp := io.Pipe()
