@@ -606,6 +606,11 @@ const (
 	MsgBuiltinCmdAllow     MsgKey = "allow"
 	MsgBuiltinCmdModel     MsgKey = "model"
 	MsgBuiltinCmdReasoning MsgKey = "reasoning"
+	MsgBuiltinCmdFast      MsgKey = "fast"
+	MsgFastUsage           MsgKey = "fast_usage"
+	MsgFastNotSupported    MsgKey = "fast_not_supported"
+	MsgFastFailed          MsgKey = "fast_failed"
+	MsgFastCurrent         MsgKey = "fast_current"
 	MsgBuiltinCmdMode      MsgKey = "mode"
 	MsgBuiltinCmdLang      MsgKey = "lang"
 	MsgBuiltinCmdQuiet     MsgKey = "quiet"
@@ -1066,7 +1071,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  View/edit agent memory files\n\n" +
 			"/allow <tool>\n  Pre-allow a tool (next session)\n\n" +
 			"/model [switch <name>]\n  View/switch model\n\n" +
-			"/reasoning [level]\n  View/switch reasoning effort\n\n" +
+			"/fast [on|off]\n  View/change Fast request preference\n\n/reasoning [level]\n  View/switch reasoning effort\n\n" +
 			"/mode [name]\n  View/switch permission mode\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  View/switch language\n\n" +
 			"/compress\n  Compress conversation context\n\n" +
@@ -1110,7 +1115,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  查看/编辑 Agent 记忆文件\n\n" +
 			"/allow <工具名>\n  预授权工具（下次会话生效）\n\n" +
 			"/model [switch <名称>]\n  查看/切换模型\n\n" +
-			"/reasoning [级别]\n  查看/切换推理强度\n\n" +
+			"/fast [on|off]\n  查看/更改 Fast 请求设置\n\n/reasoning [级别]\n  查看/切换推理强度\n\n" +
 			"/mode [名称]\n  查看/切换权限模式\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  查看/切换语言\n\n" +
 			"/compress\n  压缩会话上下文\n\n" +
@@ -1154,7 +1159,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  查看/編輯 Agent 記憶檔案\n\n" +
 			"/allow <工具名>\n  預授權工具（下次會話生效）\n\n" +
 			"/model [switch <名稱>]\n  查看/切換模型\n\n" +
-			"/reasoning [級別]\n  查看/切換推理強度\n\n" +
+			"/fast [on|off]\n  查看/變更 Fast 請求設定\n\n/reasoning [級別]\n  查看/切換推理強度\n\n" +
 			"/mode [名稱]\n  查看/切換權限模式\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  查看/切換語言\n\n" +
 			"/compress\n  壓縮會話上下文\n\n" +
@@ -1196,7 +1201,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  エージェントメモリの表示/編集\n\n" +
 			"/allow <ツール名>\n  ツールを事前許可（次のセッションで有効）\n\n" +
 			"/model [switch <名前>]\n  モデルの表示/切り替え\n\n" +
-			"/reasoning [レベル]\n  推論レベルの表示/切り替え\n\n" +
+			"/fast [on|off]\n  Fast リクエスト設定の表示・変更\n\n/reasoning [レベル]\n  推論レベルの表示/切り替え\n\n" +
 			"/mode [名前]\n  権限モードの表示/切り替え\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  言語の表示/切り替え\n\n" +
 			"/compress\n  会話コンテキストを圧縮\n\n" +
@@ -1238,7 +1243,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  Ver/editar archivos de memoria del agente\n\n" +
 			"/allow <herramienta>\n  Pre-autorizar herramienta (próxima sesión)\n\n" +
 			"/model [switch <nombre>]\n  Ver/cambiar modelo\n\n" +
-			"/reasoning [nivel]\n  Ver/cambiar nivel de razonamiento\n\n" +
+			"/fast [on|off]\n  Ver/cambiar preferencia Fast\n\n/reasoning [nivel]\n  Ver/cambiar nivel de razonamiento\n\n" +
 			"/mode [nombre]\n  Ver/cambiar modo de permisos\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  Ver/cambiar idioma\n\n" +
 			"/compress\n  Comprimir contexto de conversación\n\n" +
@@ -3763,6 +3768,46 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "モデルの表示/切り替え、引数: [名前]",
 		LangSpanish:            "Ver/cambiar modelo, arg: [nombre]",
 	},
+	MsgFastUsage: {
+		LangEnglish:            "Usage: `/fast [on|off]`",
+		LangChinese:            "用法：`/fast [on|off]`",
+		LangTraditionalChinese: "用法：`/fast [on|off]`",
+		LangJapanese:           "使い方: `/fast [on|off]`",
+		LangSpanish:            "Uso: `/fast [on|off]`",
+	},
+
+	MsgFastNotSupported: {
+		LangEnglish:            "This agent does not support Fast requests.",
+		LangChinese:            "当前 Agent 不支持 Fast 请求。",
+		LangTraditionalChinese: "目前 Agent 不支援 Fast 請求。",
+		LangJapanese:           "このエージェントは Fast リクエストに対応していません。",
+		LangSpanish:            "Este agente no admite solicitudes Fast.",
+	},
+
+	MsgFastFailed: {
+		LangEnglish:            "Fast preference was not changed: %v",
+		LangChinese:            "Fast 请求设置未更改：%v",
+		LangTraditionalChinese: "Fast 請求設定未變更：%v",
+		LangJapanese:           "Fast 設定は変更されませんでした: %v",
+		LangSpanish:            "La preferencia Fast no cambió: %v",
+	},
+
+	MsgFastCurrent: {
+		LangEnglish:            "Fast request preference: %s. Applies to the next new turn; the running turn keeps its tier. This preference does not confirm account/model acceptance. Request failures are reported during execution.",
+		LangChinese:            "Fast 请求设置：%s。从下一新轮次生效，当前轮次保持原速度层级。此设置不代表账号或模型已接受 Fast；请求失败会在执行时报告。",
+		LangTraditionalChinese: "Fast 請求設定：%s。從下一新輪次生效，目前輪次保持原速度層級。此設定不代表帳號或模型已接受 Fast；請求失敗會在執行時回報。",
+		LangJapanese:           "Fast リクエスト設定: %s。次の新しいターンから適用されます。実行中のターンは変更されません。アカウントやモデルの受理は未確認です。リクエストの失敗は実行時に報告されます。",
+		LangSpanish:            "Preferencia de solicitud Fast: %s. Se aplica al próximo turno nuevo; el turno en curso conserva su nivel. No confirma la aceptación de la cuenta o modelo. Los fallos se informan durante la ejecución.",
+	},
+
+	MsgBuiltinCmdFast: {
+		LangEnglish:            "View/change Fast request preference (next turn)",
+		LangChinese:            "查看/更改 Fast 请求设置（下一轮生效）",
+		LangTraditionalChinese: "查看/變更 Fast 請求設定（下一輪生效）",
+		LangJapanese:           "Fast リクエスト設定の表示・変更（次のターン）",
+		LangSpanish:            "Ver/cambiar preferencia Fast (próximo turno)",
+	},
+
 	MsgBuiltinCmdReasoning: {
 		LangEnglish:            "View/switch reasoning effort, arg: [level]",
 		LangChinese:            "查看/切换推理强度，参数: [等级]",

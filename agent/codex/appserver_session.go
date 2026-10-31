@@ -45,6 +45,7 @@ type threadStartResponse struct {
 	Cwd             string  `json:"cwd"`
 	Model           string  `json:"model"`
 	ReasoningEffort *string `json:"reasoningEffort"`
+	ServiceTier     *string `json:"serviceTier"`
 	Thread          struct {
 		ID string `json:"id"`
 	} `json:"thread"`
@@ -54,6 +55,7 @@ type threadResumeResponse struct {
 	Cwd             string  `json:"cwd"`
 	Model           string  `json:"model"`
 	ReasoningEffort *string `json:"reasoningEffort"`
+	ServiceTier     *string `json:"serviceTier"`
 	Thread          struct {
 		ID string `json:"id"`
 	} `json:"thread"`
@@ -154,6 +156,7 @@ type appServerSession struct {
 	extraEnv       []string
 	codexHome      string
 	promptPreamble string
+	serviceTier    func() string // immutable callback; Agent owns the synchronized preference
 
 	events       chan core.Event
 	eventsMu     sync.RWMutex // publishers share the lock; Close owns channel closure
@@ -198,7 +201,7 @@ const (
 	appServerUsageRefreshTimeout = 1500 * time.Millisecond
 )
 
-func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []string, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
+func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []string, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string, tierSource ...func() string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &appServerSession{
 		cliBin:           cliBin,
@@ -219,6 +222,9 @@ func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []stri
 		pending:          make(map[int64]chan rpcResponseEnvelope),
 		pendingApprovals: make(map[string]chan core.PermissionResult),
 		preambleSent:     resumeID != "" && resumeID != core.ContinueSession,
+	}
+	if len(tierSource) > 0 {
+		s.serviceTier = tierSource[0]
 	}
 	s.alive.Store(true)
 
@@ -361,6 +367,7 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 	if resumeID != "" && resumeID != core.ContinueSession {
 		params := s.threadRequestParams()
 		params["threadId"] = resumeID
+		requestedTier, _ := params["serviceTier"].(string)
 
 		var resp threadResumeResponse
 		if err := s.request("thread/resume", params, &resp); err != nil {
@@ -369,18 +376,26 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 		if resp.Thread.ID == "" {
 			return fmt.Errorf("codex app-server resume returned empty thread id")
 		}
+		if err := validateServiceTierResponse(requestedTier, resp.ServiceTier); err != nil {
+			return err
+		}
 		s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
 		s.threadID.Store(resp.Thread.ID)
 		slog.Info("codex app-server thread resumed", "thread_id", resp.Thread.ID)
 		return nil
 	}
 
+	params := s.threadRequestParams()
+	requestedTier, _ := params["serviceTier"].(string)
 	var resp threadStartResponse
-	if err := s.request("thread/start", s.threadRequestParams(), &resp); err != nil {
+	if err := s.request("thread/start", params, &resp); err != nil {
 		return err
 	}
 	if resp.Thread.ID == "" {
 		return fmt.Errorf("codex app-server start returned empty thread id")
+	}
+	if err := validateServiceTierResponse(requestedTier, resp.ServiceTier); err != nil {
+		return err
 	}
 	s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
 	s.threadID.Store(resp.Thread.ID)
@@ -392,6 +407,9 @@ func (s *appServerSession) threadRequestParams() map[string]any {
 	params := map[string]any{
 		"experimentalRawEvents":  false,
 		"persistExtendedHistory": false,
+	}
+	if tier := s.requestedServiceTier(); tier != "" {
+		params["serviceTier"] = tier
 	}
 	if model := s.GetModel(); model != "" {
 		params["model"] = model
@@ -520,6 +538,11 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	params := map[string]any{
 		"threadId": threadID,
 		"input":    input,
+	}
+	// Only the new turn receives this preference. A busy-message steer keeps
+	// the active turn and its tier intact.
+	if tier := s.requestedServiceTier(); tier != "" {
+		params["serviceTierForTurn"] = tier
 	}
 	if model := s.GetModel(); model != "" {
 		params["model"] = model

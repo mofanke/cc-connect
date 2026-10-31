@@ -1703,6 +1703,7 @@ app_secret = "your-feishu-app-secret"
 #
 # [projects.agent.options]
 # backend = "app_server" # Default: steer ordinary messages into the active turn.
+# service_tier = "default" # Codex >= 0.166.0; "fast" requests priority, acceptance depends on account/model
 # backend = "exec"       # Legacy opt-in: queue busy messages until the turn ends.
 
 # work_dir = "/path/to/project"

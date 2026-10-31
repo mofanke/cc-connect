@@ -355,6 +355,8 @@ type RateLimitCfg struct {
 
 // Engine routes messages between platforms and the agent for a single project.
 type Engine struct {
+	fastMu sync.Mutex // serialize preference persistence with live changes
+
 	name                  string
 	agent                 Agent
 	platforms             []Platform
@@ -1455,6 +1457,11 @@ func (e *Engine) SetBaseWorkDir(dir string) {
 
 func (e *Engine) SetProjectStateStore(store *ProjectStateStore) {
 	e.projectState = store
+	if fs, ok := e.agent.(FastModeSwitcher); ok && store != nil {
+		if tier := store.ServiceTierOverride(""); tier != "" {
+			fs.SetFastMode(tier == "fast")
+		}
+	}
 }
 
 func (e *Engine) SetDataDir(dir string) {
@@ -4215,6 +4222,9 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 	opts["work_dir"] = workspace
 
 	if e.projectState != nil {
+		if tier := e.projectState.ServiceTierOverride(workspace); tier != "" {
+			opts["service_tier"] = tier
+		}
 		if m := e.projectState.WorkspaceModelOverride(workspace); m != "" {
 			opts["model"] = m
 		}
@@ -7071,6 +7081,7 @@ var builtinCommands = []struct {
 	{[]string{"allow"}, "allow"},
 	{[]string{"model"}, "model"},
 	{[]string{"reasoning", "effort"}, "reasoning"},
+	{[]string{"fast"}, "fast"},
 	{[]string{"mode"}, "mode"},
 	{[]string{"lang"}, "lang"},
 	{[]string{"quiet"}, "quiet"},
@@ -7281,6 +7292,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		if !e.cmdModel(p, msg, args) {
 			return false
 		}
+	case "fast":
+		e.cmdFast(p, msg, args)
 	case "reasoning":
 		e.cmdReasoning(p, msg, args)
 	case "mode":
@@ -10130,6 +10143,7 @@ func helpCardGroups() []helpCardGroup {
 			items: []helpCardItem{
 				{command: "/model", action: "nav:/model"},
 				{command: "/reasoning", action: "nav:/reasoning"},
+				{command: "/fast", action: "cmd:/fast"},
 				{command: "/mode", action: "nav:/mode"},
 				{command: "/lang", action: "nav:/lang"},
 				{command: "/provider", action: "nav:/provider"},
@@ -10254,6 +10268,12 @@ func (e *Engine) GetAllCommands() []BotCommandInfo {
 	for _, c := range builtinCommands {
 		if len(c.names) == 0 {
 			continue
+		}
+		// Only capable agents advertise Fast in registered command lists.
+		if c.id == "fast" {
+			if _, ok := e.agent.(FastModeSwitcher); !ok {
+				continue
+			}
 		}
 		// Use id as primary
 		primaryName := c.id

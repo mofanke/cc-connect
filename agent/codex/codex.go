@@ -36,6 +36,9 @@ type Agent struct {
 	workDir         string
 	model           string
 	reasoningEffort string
+	serviceTier     string
+	fastSupportOnce sync.Once
+	fastSupportErr  error
 	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
 	backend         string // "exec" | "app_server"
 	appServerURL    string
@@ -58,6 +61,19 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 	model, _ := opts["model"].(string)
 	reasoningEffort, _ := opts["reasoning_effort"].(string)
+	rawTier, _ := opts["service_tier"].(string)
+	if raw, exists := opts["service_tier"]; exists {
+		if _, ok := raw.(string); !ok {
+			return nil, fmt.Errorf("codex: service_tier must be a string")
+		}
+	}
+	serviceTier, err := normalizeServiceTier(rawTier)
+	if err != nil {
+		return nil, err
+	}
+	if serviceTier == "" {
+		serviceTier = "default"
+	}
 	mode, _ := opts["mode"].(string)
 	backend, _ := opts["backend"].(string)
 	appServerURL, _ := opts["app_server_url"].(string)
@@ -66,6 +82,9 @@ func New(opts map[string]any) (core.Agent, error) {
 	appendPrompt, _ := opts["append_system_prompt"].(string)
 	mode = normalizeMode(mode)
 	backend = normalizeBackend(backend)
+	if backend == "exec" && serviceTier == "fast" {
+		return nil, fmt.Errorf("codex: Fast switching is unsupported on exec; use backend=app_server")
+	}
 	appServerURL = normalizeAppServerURL(appServerURL)
 
 	cmd, cliExtraArgs := core.ParseCmdOpts(opts, "")
@@ -98,6 +117,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		workDir:         workDir,
 		model:           model,
 		reasoningEffort: normalizeReasoningEffort(reasoningEffort),
+		serviceTier:     serviceTier,
 		mode:            mode,
 		backend:         backend,
 		appServerURL:    appServerURL,
@@ -491,6 +511,11 @@ func (a *Agent) SetSessionEnv(env []string) {
 }
 
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
+	if a.FastModeEnabled() {
+		if err := a.FastModeSupported(); err != nil {
+			return nil, err
+		}
+	}
 	a.mu.Lock()
 	mode := a.mode
 	model := a.model
@@ -530,7 +555,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 
 	if backend == "app_server" {
-		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
+		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt, a.serviceTierPreference)
 	}
 	if codexHome != "" {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
@@ -597,6 +622,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	}
 	if a.reasoningEffort != "" {
 		opts["reasoning_effort"] = a.reasoningEffort
+	}
+	if a.serviceTier != "" {
+		opts["service_tier"] = a.serviceTier
 	}
 	if a.appServerURL != "" {
 		opts["app_server_url"] = a.appServerURL

@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -9,9 +10,11 @@ import (
 )
 
 type projectStateData struct {
-	WorkDirOverride         string            `json:"work_dir_override,omitempty"`
-	WorkspaceDirOverrides   map[string]string `json:"workspace_dir_overrides,omitempty"`
-	WorkspaceModelOverrides map[string]string `json:"workspace_model_overrides,omitempty"`
+	ServiceTierOverride           string            `json:"service_tier_override,omitempty"`
+	WorkspaceServiceTierOverrides map[string]string `json:"workspace_service_tier_overrides,omitempty"`
+	WorkDirOverride               string            `json:"work_dir_override,omitempty"`
+	WorkspaceDirOverrides         map[string]string `json:"workspace_dir_overrides,omitempty"`
+	WorkspaceModelOverrides       map[string]string `json:"workspace_model_overrides,omitempty"`
 }
 
 // ProjectStateStore persists lightweight runtime state for one project.
@@ -112,26 +115,27 @@ func (ps *ProjectStateStore) ClearWorkDirOverride() {
 func (ps *ProjectStateStore) Save() {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
-	ps.saveLocked()
+	if err := ps.saveLocked(); err != nil {
+		slog.Error("project_state: failed to save", "error", err)
+	}
 }
 
-func (ps *ProjectStateStore) saveLocked() {
+func (ps *ProjectStateStore) saveLocked() error {
 	if ps.storePath == "" {
-		return
+		return nil
 	}
 
 	data, err := json.MarshalIndent(ps.state, "", "  ")
 	if err != nil {
-		slog.Error("project_state: failed to marshal", "error", err)
-		return
+		return fmt.Errorf("project state: marshal: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(ps.storePath), 0o755); err != nil {
-		slog.Error("project_state: failed to create dir", "path", ps.storePath, "error", err)
-		return
+		return fmt.Errorf("project state: create directory: %w", err)
 	}
 	if err := AtomicWriteFile(ps.storePath, data, 0o644); err != nil {
-		slog.Error("project_state: failed to write", "path", ps.storePath, "error", err)
+		return fmt.Errorf("project state: write: %w", err)
 	}
+	return nil
 }
 
 func (ps *ProjectStateStore) load() {
@@ -149,4 +153,41 @@ func (ps *ProjectStateStore) load() {
 		return
 	}
 	ps.state = state
+}
+
+// ServiceTierOverride returns the persisted request preference for a workspace.
+// The empty workspace identifies the default project agent.
+func (ps *ProjectStateStore) ServiceTierOverride(workspace string) string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if workspace == "" {
+		return ps.state.ServiceTierOverride
+	}
+	return ps.state.WorkspaceServiceTierOverrides[workspace]
+}
+
+// SaveServiceTierOverride commits the preference before the live agent changes.
+// Failed writes restore the previous in-memory state too.
+func (ps *ProjectStateStore) SaveServiceTierOverride(workspace, tier string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if tier != "fast" && tier != "default" {
+		return fmt.Errorf("project state: invalid service tier %q", tier)
+	}
+	old := ps.state
+	overrides := make(map[string]string, len(old.WorkspaceServiceTierOverrides))
+	for k, v := range old.WorkspaceServiceTierOverrides {
+		overrides[k] = v
+	}
+	if workspace == "" {
+		ps.state.ServiceTierOverride = tier
+	} else {
+		overrides[workspace] = tier
+		ps.state.WorkspaceServiceTierOverrides = overrides
+	}
+	if err := ps.saveLocked(); err != nil {
+		ps.state = old
+		return err
+	}
+	return nil
 }
