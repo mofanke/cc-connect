@@ -538,6 +538,7 @@ type queuedMessage struct {
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
 	agentSession             AgentSession
+	startErr                 error
 	platform                 Platform
 	replyCtx                 any
 	currentMessageID         string
@@ -4196,7 +4197,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 				Platform:   p.Name(),
 				Error:      fmt.Sprintf("failed to start session: %v", err),
 			})
-			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
+			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, startErr: err, eventsNeedResync: true}
 			adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 			state = newState
 			e.interactiveStates[sessionKey] = state
@@ -8882,21 +8883,16 @@ func formatUsageBlocks(report *UsageReport, lang Language) string {
 	return "\n\n" + strings.Join(sections, "\n\n")
 }
 
+// accountDisplay deliberately excludes personal identifiers: quota replies can
+// be posted to shared chats, and messaging platforms may reject email addresses.
 func accountDisplay(report *UsageReport) string {
-	var base string
-	if report.Email != "" {
-		base = report.Email
-	} else if report.AccountID != "" {
-		base = report.AccountID
-	} else if report.UserID != "" {
-		base = report.UserID
-	} else {
-		base = "-"
-	}
 	if report.Plan != "" {
-		return fmt.Sprintf("%s (%s)", base, report.Plan)
+		return report.Plan
 	}
-	return base
+	if report.Provider != "" {
+		return report.Provider
+	}
+	return "-"
 }
 
 func selectUsageWindows(report *UsageReport) (*UsageWindow, *UsageWindow) {
@@ -9801,6 +9797,9 @@ func (e *Engine) sessionConfigCard(p Platform, msg *Message, category, input str
 	state := e.getOrCreateInteractiveStateWith(key, p, msg.ReplyCtx, session, sessions, agent, msg.SessionKey)
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.startErr != nil {
+		return failure(state.startErr)
+	}
 	live, ok := state.agentSession.(LiveSessionConfigurer)
 	if !ok {
 		return failure(fmt.Errorf("%s", e.i18n.Tf(MsgLiveConfigUnavailable, category)))
@@ -9841,6 +9840,19 @@ func (e *Engine) sessionConfigCard(p Platform, msg *Message, category, input str
 		}
 		if err := live.SetSessionConfigOption(e.ctx, option.ID, target); err != nil {
 			return failure(err)
+		}
+		if category == "model" {
+			if _, ok := agent.(ModelSwitcher); ok {
+				resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
+				if err != nil {
+					return failure(err)
+				}
+				e.persistWorkspaceModelOverride(key, msg.SessionKey, agent, resolved)
+			}
+		} else if category == "thought_level" {
+			if switcher, ok := agent.(ReasoningEffortSwitcher); ok {
+				switcher.SetReasoningEffort(target)
+			}
 		}
 		option, ok = find()
 		if !ok {

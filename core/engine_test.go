@@ -6093,7 +6093,7 @@ func TestCmdUsage_Success(t *testing.T) {
 	}
 	got := p.sent[0]
 	for _, want := range []string{
-		"Account: dev@example.com (team)",
+		"Account: team",
 		"5h limit",
 		"Remaining: 77%",
 		"Resets: 1h 51m",
@@ -6143,7 +6143,7 @@ func TestCmdUsage_UsesCardOnCardPlatform(t *testing.T) {
 	}
 	text := p.repliedCards[0].RenderText()
 	for _, want := range []string{
-		"账号：dev@example.com (team)",
+		"账号：team",
 		"5小时限额",
 		"剩余：77%",
 		"重置：1小时 51分钟",
@@ -6186,7 +6186,7 @@ func TestCmdUsage_LocalizedChinese(t *testing.T) {
 	}
 	got := p.sent[0]
 	for _, want := range []string{
-		"账号：dev@example.com (team)",
+		"账号：team",
 		"5小时限额",
 		"剩余：77%",
 		"重置：1小时 51分钟",
@@ -16249,5 +16249,36 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 	}
 	if strings.Contains(card.finalContent(), "NO_REPLY") {
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
+	}
+}
+
+// Regression: personal identifiers in /usage caused Feishu to reject the
+// entire reply with code 230028 (EMAIL_ADDRESS), hiding the quota information.
+func TestCmdUsage_OmitsPersonalIdentifiers(t *testing.T) {
+	for _, lang := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
+		t.Run(string(lang), func(t *testing.T) {
+			report := &UsageReport{
+				Provider: "codex", Email: "private@example.com", AccountID: "private-account-id", UserID: "private-user-id", Plan: "prolite",
+				Buckets: []UsageBucket{{Windows: []UsageWindow{{UsedPercent: 79, WindowSeconds: 604800, ResetAfterSeconds: 3600}}}},
+			}
+			p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+			e := NewEngine("test", &stubUsageAgent{report: report}, []Platform{p}, "", lang)
+			e.ReceiveMessage(p, &Message{SessionKey: "test:chat:user", UserID: "user", Content: "/usage", ReplyCtx: "ctx"})
+			if len(p.repliedCards) != 1 {
+				t.Fatalf("expected usage card, got %d", len(p.repliedCards))
+			}
+			for _, output := range []string{p.repliedCards[0].RenderText(), formatUsageReport(report, lang)} {
+				for _, private := range []string{report.Email, report.AccountID, report.UserID} {
+					if strings.Contains(output, private) {
+						t.Fatalf("usage exposes personal identifier %q: %s", private, output)
+					}
+				}
+				for _, want := range []string{"prolite", "21%"} {
+					if !strings.Contains(output, want) {
+						t.Fatalf("usage missing %q: %s", want, output)
+					}
+				}
+			}
+		})
 	}
 }

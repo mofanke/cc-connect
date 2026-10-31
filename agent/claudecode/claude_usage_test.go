@@ -29,6 +29,18 @@ func TestSanitizeClaudeUsageOutput_RendersCursorMoves(t *testing.T) {
 	}
 }
 
+func TestClaudeUsageTerminal_CSI_G(t *testing.T) {
+	terminal := newClaudeUsageTerminal()
+	terminal.Write([]byte("Current\x1b[12Gsession\r\n\x1b[1G0%\x1b[5Gused"))
+	got := normalizeClaudeUsageText(terminal.String())
+	if !strings.Contains(got, "Current session") {
+		t.Fatalf("expected Current session, got: %q", got)
+	}
+	if !strings.Contains(got, "0% used") {
+		t.Fatalf("expected 0%% used, got: %q", got)
+	}
+}
+
 func TestParseClaudeUsageReport_Success(t *testing.T) {
 	loc := mustLoadLocation(t, "Asia/Seoul")
 	now := time.Date(2026, time.December, 22, 12, 0, 0, 0, loc)
@@ -261,6 +273,74 @@ func TestAgentGetUsageSmoke(t *testing.T) {
 	}
 }
 
+func TestPromptActionForScreen(t *testing.T) {
+	tests := []struct {
+		name   string
+		screen string
+		want   string
+	}{
+		{
+			name:   "empty screen",
+			screen: "",
+			want:   "",
+		},
+		{
+			name: "quick safety check default no selected",
+			screen: `Quick safety check: Is this a project you created or one you trust?
+❯ No, exit
+  Yes, I trust this folder
+Enter to confirm · Esc to cancel`,
+			want: "\x1b[B\r",
+		},
+		{
+			name: "quick safety check yes already selected",
+			screen: `Quick safety check: Is this a project you created or one you trust?
+  No, exit
+❯ Yes, I trust this folder
+Enter to confirm · Esc to cancel`,
+			want: "\r",
+		},
+		{
+			name: "bypass permissions default no selected",
+			screen: `WARNING: Claude Code running in Bypass Permissions mode
+❯ No, exit
+  Yes, I accept
+Enter to confirm · Esc to cancel`,
+			want: "\x1b[B\r",
+		},
+		{
+			name: "bypass permissions yes already selected",
+			screen: `WARNING: Claude Code running in Bypass Permissions mode
+  No, exit
+❯ Yes, I accept
+Enter to confirm · Esc to cancel`,
+			want: "\r",
+		},
+		{
+			name: "telemetry prompt",
+			screen: `Help improve Claude Code by sharing telemetry?
+1. Yes
+2. No
+Enter to confirm`,
+			want: "\x1b[B\r",
+		},
+		{
+			name:   "generic enter to confirm",
+			screen: "Press Enter to confirm",
+			want:   "\r",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := promptActionForScreen(tt.screen)
+			if got != tt.want {
+				t.Fatalf("promptActionForScreen() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func mustLoadLocation(t *testing.T, name string) *time.Location {
 	t.Helper()
 	loc, err := time.LoadLocation(name)
@@ -268,4 +348,20 @@ func mustLoadLocation(t *testing.T, name string) *time.Location {
 		t.Fatalf("LoadLocation(%q): %v", name, err)
 	}
 	return loc
+}
+
+func TestDetectClaudeUsageOutputError_RateLimitedPanel(t *testing.T) {
+	panel := "Settings Status Config Usage Stats\nError: Usage endpoint is rate limited. Please try again in a moment.\nr to retry · Esc to cancel"
+	for _, source := range []string{"screen", "stderr"} {
+		t.Run(source, func(t *testing.T) {
+			screen, stderr := panel, ""
+			if source == "stderr" {
+				screen, stderr = "", panel
+			}
+			err := detectClaudeUsageOutputError(screen, stderr)
+			if err == nil || !strings.Contains(err.Error(), "rate limited") {
+				t.Fatalf("got %v, want explicit usage endpoint rate limit", err)
+			}
+		})
+	}
 }

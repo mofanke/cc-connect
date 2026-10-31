@@ -46,15 +46,41 @@ import (
 // ---------------------------------------------------------------------------
 
 type liveConfigTestAgent struct {
-	stubAgent
-	session *liveConfigTestSession
-	starts  int
+	stubModelModeAgent
+	session  *liveConfigTestSession
+	starts   int
+	startErr error
 }
 
 func (a *liveConfigTestAgent) SupportsSessionConfig() bool { return true }
 func (a *liveConfigTestAgent) StartSession(context.Context, string) (AgentSession, error) {
 	a.starts++
+	if a.startErr != nil {
+		return nil, a.startErr
+	}
 	return a.session, nil
+}
+
+func TestCUJ_M1_LiveConfigStartupFailureShowsCauseAndRecovers(t *testing.T) {
+	agent := &liveConfigTestAgent{startErr: errors.New("model metadata could not be resolved")}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("live-config-startup", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	for _, command := range []string{"/model", "/reasoning"} {
+		p.clearSent()
+		e.ReceiveMessage(p, &Message{SessionKey: "test:chat:user", UserID: "user", Content: command})
+		if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "model metadata could not be resolved") {
+			t.Fatalf("%s hid startup failure: %s", command, got)
+		}
+	}
+	agent.startErr = nil
+	agent.session = &liveConfigTestSession{options: []SessionConfigOption{
+		{ID: "model", Category: "model", Type: "select", CurrentValue: "a", Options: []SessionConfigValue{{Value: "a", Name: "Model A"}}},
+	}}
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{SessionKey: "test:chat:user", UserID: "user", Content: "/model"})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Model A") || strings.Contains(got, "metadata could not be resolved") {
+		t.Fatalf("model menu did not recover: %s", got)
+	}
 }
 
 type liveConfigTestSession struct {
@@ -86,6 +112,11 @@ func TestCUJ_M1_LiveConfigPreservesSessionAndHistory(t *testing.T) {
 	agent := &liveConfigTestAgent{session: live}
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("live-config", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	var savedModels []string
+	e.SetModelSaveFunc(func(model string) error {
+		savedModels = append(savedModels, model)
+		return nil
+	})
 	session := e.sessions.GetOrCreateActive("test:chat:user")
 	session.AddHistory("user", "keep this context")
 	for _, cmd := range []string{"/model", "/model b", "/reasoning high"} {
@@ -124,11 +155,21 @@ func TestCUJ_M1_LiveConfigPreservesSessionAndHistory(t *testing.T) {
 	if !strings.Contains(card.RenderText(), "busy") {
 		t.Fatal("busy session not protected")
 	}
+	card = e.handleCardNav("act:/model b", "test:chat:user")
+	if card == nil || !strings.Contains(card.RenderText(), "b") {
+		t.Fatal("model did not recover after busy session")
+	}
 	if agent.starts != 1 || live.closed || session.GetAgentSessionID() != "stub-session" {
 		t.Fatalf("session restarted: starts=%d closed=%v", agent.starts, live.closed)
 	}
 	if history := session.GetHistory(0); len(history) != 1 || history[0].Content != "keep this context" {
 		t.Fatalf("history lost: %#v", history)
+	}
+	if agent.GetModel() != "b" || agent.GetReasoningEffort() != "low" {
+		t.Fatalf("agent defaults not synchronized: model=%q reasoning=%q", agent.GetModel(), agent.GetReasoningEffort())
+	}
+	if got := strings.Join(savedModels, ","); got != "b,a,b" {
+		t.Fatalf("saved models = %q, want successful live selections", got)
 	}
 }
 

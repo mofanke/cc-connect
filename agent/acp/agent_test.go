@@ -100,6 +100,7 @@ func TestWorkspaceAgentOptions(t *testing.T) {
 		"env":          map[string]any{"FOO": "bar", "COPILOT_VALUE": "a=b"},
 		"auth_method":  "cursor_login",
 		"display_name": "Copilot ACP",
+		"trae_home":    "/tmp/ignored-for-generic-acp",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -130,6 +131,9 @@ func TestWorkspaceAgentOptions(t *testing.T) {
 	}
 	if got, _ := opts["display_name"].(string); got != "Copilot ACP" {
 		t.Fatalf("display_name = %q, want Copilot ACP", got)
+	}
+	if got, _ := opts["trae_home"].(string); got != "/tmp/ignored-for-generic-acp" {
+		t.Fatalf("trae_home = %q, want preserved option", got)
 	}
 }
 

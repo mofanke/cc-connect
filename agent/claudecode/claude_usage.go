@@ -47,8 +47,12 @@ type claudeUsageProbeState struct {
 }
 
 func (a *Agent) GetUsage(ctx context.Context) (*core.UsageReport, error) {
-	if _, err := exec.LookPath("claude"); err != nil {
-		return nil, fmt.Errorf("claudecode: 'claude' CLI not found in PATH")
+	bin := "claude"
+	if a.cmd != "" {
+		bin = a.cmd
+	}
+	if _, err := exec.LookPath(bin); err != nil {
+		return nil, fmt.Errorf("claudecode: %q CLI not found in PATH", bin)
 	}
 
 	screen, err := a.runClaudeUsageProbe(ctx)
@@ -73,7 +77,11 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 		"--permission-mode", "plan",
 		"--no-chrome",
 	}
-	cmd := exec.CommandContext(probeCtx, "claude", args...)
+	bin := "claude"
+	if a.cmd != "" {
+		bin = a.cmd
+	}
+	cmd := exec.CommandContext(probeCtx, bin, args...)
 	cmd.Dir = workDir
 
 	env := filterEnv(os.Environ(), "CLAUDECODE")
@@ -170,6 +178,16 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 				return "", screenErr
 			}
 			if waitErr != nil {
+				snippet := strings.TrimSpace(lastScreen)
+				if snippet == "" {
+					snippet = strings.TrimSpace(stderr.String())
+				}
+				if len(snippet) > 200 {
+					snippet = snippet[len(snippet)-200:]
+				}
+				if snippet != "" {
+					return "", fmt.Errorf("claudecode: Claude Code exited before /usage rendered (%s): %w", snippet, waitErr)
+				}
 				return "", fmt.Errorf("claudecode: Claude Code exited before /usage rendered: %w", waitErr)
 			}
 			return "", fmt.Errorf("claudecode: Claude Code exited before /usage rendered")
@@ -254,7 +272,16 @@ func promptActionForScreen(screen string) string {
 		return ""
 	}
 	if strings.Contains(lower, "quick safety check") || strings.Contains(lower, "yes, i trust this folder") {
-		return "\r"
+		if strings.Contains(lower, "❯ yes, i trust this folder") || strings.Contains(lower, "> yes, i trust this folder") {
+			return "\r"
+		}
+		return "\x1b[B\r"
+	}
+	if strings.Contains(lower, "bypass permissions mode") || strings.Contains(lower, "yes, i accept") {
+		if strings.Contains(lower, "❯ yes, i accept") || strings.Contains(lower, "> yes, i accept") {
+			return "\r"
+		}
+		return "\x1b[B\r"
 	}
 	if (strings.Contains(lower, "telemetry") || strings.Contains(lower, "help improve") || strings.Contains(lower, "usage data")) &&
 		(strings.Contains(lower, "2. no") || strings.Contains(lower, "2. disable") || strings.Contains(lower, "2. don't")) {
@@ -442,6 +469,8 @@ func detectClaudeUsageOutputError(screen, stderr string) error {
 	switch {
 	case joined == "":
 		return nil
+	case strings.Contains(joined, "usage endpoint is rate limited"):
+		return fmt.Errorf("claudecode: Claude usage endpoint is rate limited; wait before retrying /usage")
 	case strings.Contains(joined, "unknown command") && strings.Contains(joined, "/usage"):
 		return fmt.Errorf("claudecode: this Claude Code version does not support /usage; please upgrade Claude Code")
 	case strings.Contains(joined, "auth login") || strings.Contains(joined, "not logged in") || strings.Contains(joined, "sign in"):
@@ -583,6 +612,12 @@ func (t *claudeUsageTerminal) applyCSI(params string, final byte) {
 		}
 		t.row, t.col = row, col
 		t.ensureRow(t.row)
+	case 'G':
+		col := parseCSIInt(params, 1) - 1
+		if col < 0 {
+			col = 0
+		}
+		t.col = col
 	case 'J':
 		if params == "2" || params == "" {
 			t.lines = [][]rune{nil}

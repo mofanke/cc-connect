@@ -32,6 +32,7 @@ type Agent struct {
 	displayName     string // optional, for doctor (default "ACP")
 	model           string // optional, for Trae CLI ACP only
 	reasoningEffort string
+	traeHome        string // optional TRAE_HOME override for Trae CLI
 
 	// mode is the pending permission mode to apply to new sessions.
 	// When set, StartSession applies it via session/set_mode right after
@@ -71,7 +72,7 @@ var _ sessionCallbacks = (*Agent)(nil)
 // New builds an acp agent from project options.
 // Required: options["command"] — executable name or path for the ACP agent.
 // Optional: options["args"], options["env"], options["auth_method"],
-// options["display_name"], options["mode"].
+// options["display_name"], options["mode"], options["trae_home"].
 func New(opts map[string]any) (core.Agent, error) {
 	workDir, _ := opts["work_dir"].(string)
 	if workDir == "" {
@@ -100,6 +101,8 @@ func New(opts map[string]any) (core.Agent, error) {
 	model, _ := opts["model"].(string)
 	model = strings.TrimSpace(model)
 	effort, _ := opts["reasoning_effort"].(string)
+	traeHome, _ := opts["trae_home"].(string)
+	traeHome = strings.TrimSpace(traeHome)
 
 	agent := &Agent{
 		workDir:         workDir,
@@ -113,6 +116,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		mode:            mode,
 		model:           model,
 		reasoningEffort: normalizeTraeReasoningEffort(effort),
+		traeHome:        traeHome,
 	}
 	if isTraeCLICommand(cmdStr) {
 		return &TraeAgent{Agent: agent}, nil
@@ -232,6 +236,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.reasoningEffort != "" {
 		opts["reasoning_effort"] = a.reasoningEffort
 	}
+	if a.traeHome != "" {
+		opts["trae_home"] = a.traeHome
+	}
 	return opts
 }
 
@@ -250,6 +257,9 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	pendingMode := a.mode
 	extra := append([]string(nil), a.extraEnv...)
 	extra = append(extra, a.sessionEnv...)
+	if isTraeCLICommand(command) && a.traeHome != "" {
+		extra = append(extra, "TRAE_HOME="+a.traeHome)
+	}
 	a.mu.RUnlock()
 
 	return newACPSession(ctx, acpSessionConfig{

@@ -2054,6 +2054,9 @@ app_secret = "your-feishu-app-secret"
 # cmd = "traecli"
 # args = ["acp", "serve"]
 # display_name = "Trae CLI ACP"
+# Optional Trae root (defaults to TRAE_HOME or ~/.trae). CC-Connect reads
+# <trae_home>/cli/sessions so /list and /switch include CLI fork sessions.
+# trae_home = "/path/to/.trae"
 
 # --- Example: COCO ACP ---
 # [[projects]]
