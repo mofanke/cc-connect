@@ -76,7 +76,7 @@ func TestReasoningAndModelReachSession(t *testing.T) {
 	}
 	defer s.Close()
 	args := s.(*antigravitySession).buildAntigravityArgs("existing-session", true, "plan", "", "hello")
-	want := []string{"--effort", "medium", "--model", "claude-sonnet-4-6", "--conversation", "existing-session", "--sandbox", "-p", "hello"}
+	want := []string{"--effort", "medium", "--output-format", "stream-json", "--model", "claude-sonnet-4-6", "--conversation", "existing-session", "--sandbox", "-p", "hello"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("args = %#v, want %#v", args, want)
 	}
@@ -174,6 +174,47 @@ func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
 	}
 	if contains(args, "-m") || contains(args, "--model") {
 		t.Fatalf("did not expect model flags in args, got: %v", args)
+	}
+}
+
+func TestBuildAntigravityArgs_DefaultBridgeKeepsApprovalHook(t *testing.T) {
+	s := &antigravitySession{}
+	args := s.buildAntigravityArgs("", false, "default", "/tmp/agy-config", "hello")
+	if !contains(args, "--gemini_dir=/tmp/agy-config") || !contains(args, "--dangerously-skip-permissions") {
+		t.Fatalf("default bridge args = %v", args)
+	}
+	s.extraArgs = []string{"--dangerously-skip-permissions"}
+	args = s.buildAntigravityArgs("", false, "default", "/tmp/agy-config", "hello")
+	count := 0
+	for _, arg := range args {
+		if arg == "--dangerously-skip-permissions" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("skip-permissions flag repeated %d times: %v", count, args)
+	}
+}
+
+func TestDetectNewSessionID_ConversationDB(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(dir, "old-session.db")
+	if err := os.WriteFile(old, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	newDB := filepath.Join(dir, "new-session.db")
+	if err := os.WriteFile(newDB, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &antigravitySession{workDir: t.TempDir()}
+	if got := s.detectNewSessionID(map[string]bool{"old-session.db": true}, started); got != "new-session" {
+		t.Fatalf("detected session = %q, want new-session", got)
 	}
 }
 

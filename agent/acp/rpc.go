@@ -18,15 +18,23 @@ type rpcOutcome struct {
 }
 
 type rpcErrPayload struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 func (e *rpcErrPayload) Error() string {
 	if e == nil {
 		return "json-rpc error"
 	}
-	return fmt.Sprintf("json-rpc %d: %s", e.Code, e.Message)
+	message := fmt.Sprintf("json-rpc %d: %s", e.Code, e.Message)
+	// Servers may put the actionable cause in error.data while returning a
+	// generic message such as "Internal error". Only expose textual details.
+	var detail string
+	if json.Unmarshal(e.Data, &detail) == nil && detail != "" {
+		message += ": " + detail
+	}
+	return message
 }
 
 type rpcNotifyHandler func(method string, params json.RawMessage)
