@@ -390,6 +390,14 @@ type AgentSession interface {
 	Close() error
 }
 
+// MessageSteerer accepts additional user input in the current turn without
+// creating another result event. False with no error means no input was
+// accepted and the engine should queue it for the next turn. An error means
+// delivery is uncertain; the engine must report it instead of replaying input.
+type MessageSteerer interface {
+	SteerMessage(prompt, messageID string, images []ImageAttachment, files []FileAttachment) (bool, error)
+}
+
 // PermissionResult represents the user's decision on a permission request.
 type PermissionResult struct {
 	Behavior     string         `json:"behavior"`               // "allow" or "deny"

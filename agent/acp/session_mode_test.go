@@ -331,85 +331,91 @@ func newTestSession(t *testing.T, cb sessionCallbacks) (*acpSession, *io.PipeWri
 }
 
 func TestSession_LoadHistoryExceedingEventBufferDoesNotBlock(t *testing.T) {
-	for _, loadFails := range []bool{false, true} {
-		t.Run(fmt.Sprintf("loadFails=%t", loadFails), func(t *testing.T) {
-			cb := &fakeCallbacks{}
-			s, wResp, rReq := newTestSession(t, cb)
-			deadline := time.AfterFunc(3*time.Second, func() {
-				s.cancel()
-				wResp.Close()
-				rReq.Close()
-			})
-			defer deadline.Stop()
+	for _, resume := range []bool{false, true} {
+		for _, loadFails := range []bool{false, true} {
+			t.Run(fmt.Sprintf("resume=%t/loadFails=%t", resume, loadFails), func(t *testing.T) {
+				cb := &fakeCallbacks{}
+				s, wResp, rReq := newTestSession(t, cb)
+				deadline := time.AfterFunc(3*time.Second, func() {
+					s.cancel()
+					wResp.Close()
+					rReq.Close()
+				})
+				defer deadline.Stop()
 
-			go func() {
-				sc := bufio.NewScanner(rReq)
-				for sc.Scan() {
-					var req struct {
-						ID     json.RawMessage `json:"id"`
-						Method string          `json:"method"`
-					}
-					if json.Unmarshal(sc.Bytes(), &req) != nil {
-						return
-					}
-					switch req.Method {
-					case "initialize":
-						fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}`+"\n", req.ID)
-					case "session/load":
-						for i := 0; i < 256; i++ {
-							if _, err := io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}`+"\n"); err != nil {
-								return
+				go func() {
+					sc := bufio.NewScanner(rReq)
+					for sc.Scan() {
+						var req struct {
+							ID     json.RawMessage `json:"id"`
+							Method string          `json:"method"`
+						}
+						if json.Unmarshal(sc.Bytes(), &req) != nil {
+							return
+						}
+						switch req.Method {
+						case "initialize":
+							capabilities := `{"loadSession":true}`
+							if resume {
+								capabilities = `{"sessionCapabilities":{"resume":{}}}`
 							}
+							fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":%s}}`+"\n", req.ID, capabilities)
+						case "session/load", "session/resume":
+							for i := 0; i < 256; i++ {
+								if _, err := io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}`+"\n"); err != nil {
+									return
+								}
+							}
+							io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}`+"\n")
+							io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a"}]}}}`+"\n")
+							if loadFails {
+								fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"load failed"}}`+"\n", req.ID)
+							} else {
+								fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{}}`+"\n", req.ID)
+							}
+						case "session/new":
+							fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fresh-session"}}`+"\n", req.ID)
+						case "session/prompt":
+							io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live answer"}}}}`+"\n")
+							fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", req.ID)
+							return
 						}
-						io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}`+"\n")
-						io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a"}]}}}`+"\n")
-						if loadFails {
-							fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"load failed"}}`+"\n", req.ID)
-						} else {
-							fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{}}`+"\n", req.ID)
-						}
-					case "session/new":
-						fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fresh-session"}}`+"\n", req.ID)
-					case "session/prompt":
-						io.WriteString(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live answer"}}}}`+"\n")
-						fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", req.ID)
-						return
 					}
-				}
-			}()
+				}()
 
-			if err := s.handshake("test-session-id", ""); err != nil {
-				t.Fatalf("handshake blocked while replaying history: %v", err)
-			}
-			if len(s.events) != 0 {
-				t.Fatalf("history leaked into live events: %d", len(s.events))
-			}
-			if mode, ok := cb.lastModes(); !ok || mode.CurrentModeID != "plan" {
-				t.Fatal("mode update lost during replay")
-			}
-			if options := s.SessionConfigOptions(); len(options) != 1 || options[0].CurrentValue != "a" {
-				t.Fatal("config update lost during replay")
-			}
-			wantID := "test-session-id"
-			if loadFails {
-				wantID = "fresh-session"
-			}
-			if s.CurrentSessionID() != wantID {
-				t.Fatalf("session ID = %q, want %q", s.CurrentSessionID(), wantID)
-			}
-			if err := s.Send("continue", "msg", nil, nil); err != nil {
-				t.Fatal(err)
-			}
-			if len(s.events) != 2 {
-				t.Fatalf("expected live text and result, got %d events", len(s.events))
-			}
-			if ev := <-s.events; ev.Type != core.EventText || ev.Content != "live answer" || ev.SessionID != wantID {
-				t.Fatalf("unexpected live event: %+v", ev)
-			}
-			if ev := <-s.events; ev.Type != core.EventResult || !ev.Done {
-				t.Fatalf("unexpected completion event: %+v", ev)
-			}
-		})
+				if err := s.handshake("test-session-id", ""); err != nil {
+					t.Fatalf("handshake blocked while replaying history: %v", err)
+				}
+				if len(s.events) != 0 {
+					t.Fatalf("history leaked into live events: %d", len(s.events))
+				}
+				if mode, ok := cb.lastModes(); !ok || mode.CurrentModeID != "plan" {
+					t.Fatal("mode update lost during replay")
+				}
+				if options := s.SessionConfigOptions(); len(options) != 1 || options[0].CurrentValue != "a" {
+					t.Fatal("config update lost during replay")
+				}
+				wantID := "test-session-id"
+				if loadFails {
+					wantID = "fresh-session"
+				}
+				if s.CurrentSessionID() != wantID {
+					t.Fatalf("session ID = %q, want %q", s.CurrentSessionID(), wantID)
+				}
+				if err := s.Send("continue", "msg", nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				if len(s.events) != 2 {
+					t.Fatalf("expected live text and result, got %d events", len(s.events))
+				}
+				if ev := <-s.events; ev.Type != core.EventText || ev.Content != "live answer" || ev.SessionID != wantID {
+					t.Fatalf("unexpected live event: %+v", ev)
+				}
+				if ev := <-s.events; ev.Type != core.EventResult || !ev.Done {
+					t.Fatalf("unexpected completion event: %+v", ev)
+				}
+			})
+		}
 	}
 }
 

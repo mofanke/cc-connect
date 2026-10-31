@@ -22,10 +22,10 @@ func init() {
 	core.RegisterAgent("codex", New)
 }
 
-// Agent drives OpenAI Codex CLI using `codex exec --json`.
+// Agent drives OpenAI Codex CLI, using app-server by default.
 //
-// `codex exec` has no approval IPC, so approvals are not interactive on the
-// exec backend. To get interactive approvals, switch to backend="app_server".
+// The app_server backend supports interactive approvals and active-turn steering.
+// The optional exec backend has no approval IPC.
 //
 // Modes on the exec backend (maps to codex exec flags):
 //   - "suggest":   --sandbox read-only       + approval_policy=never (no prompts)
@@ -113,7 +113,7 @@ func New(opts map[string]any) (core.Agent, error) {
 
 func normalizeBackend(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "app-server", "app_server", "appserver", "ws":
+	case "", "app-server", "app_server", "appserver", "ws":
 		return "app_server"
 	default:
 		return "exec"
@@ -824,7 +824,7 @@ func (a *Agent) activeProviderCodexConfig() (name string, apiKey string, wireAPI
 // PermissionModes returns the supported codex permission modes.
 //
 // Behavior depends on backend:
-//   - exec backend (default): codex exec has no approval IPC, so all modes run
+//   - exec backend (explicit opt-in): codex exec has no approval IPC, so all modes run
 //     with approval_policy=never. Sandbox tier is what controls access. The
 //     "suggest" label refers to the *intent* (read-only safety) — the CLI does
 //     not pop interactive approval prompts on this backend.

@@ -35,6 +35,8 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+func (e *rpcError) Error() string { return strings.TrimSpace(e.Message) }
+
 type initResponse struct {
 	ProtocolVersion string `json:"protocolVersion"`
 }
@@ -1777,7 +1779,7 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 	select {
 	case resp := <-ch:
 		if resp.Error != nil {
-			return fmt.Errorf("%s", strings.TrimSpace(resp.Error.Message))
+			return resp.Error
 		}
 		if out != nil {
 			if err := json.Unmarshal(resp.Result, out); err != nil {

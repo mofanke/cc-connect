@@ -3256,7 +3256,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		// ── end self-heal; queueing path below is unchanged ────────────────
 		// Session is busy — try to queue the message for the running turn
 		// so the agent processes it immediately after the current turn ends.
-		if e.queueMessageForBusySession(p, msg, interactiveKey) {
+		if e.queueMessageForBusySession(p, msg, interactiveKey, sessions) {
 			// Race guard: the drain loop in processInteractiveMessageWith may
 			// have just finished (session unlocked) between our TryLock failure
 			// and the queue append. Re-try TryLock — if it succeeds, no one is
@@ -3397,10 +3397,10 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 }
 
 // queueMessageForBusySession queues a message for later delivery when the
-// session is busy. The message is NOT sent to agent stdin at queue time;
-// the event loop sends it after the current turn's EventResult is received.
+// session is busy. Sessions supporting steering receive input in the active
+// turn; other sessions receive queued input after EventResult.
 // Returns true if the message was successfully queued, false otherwise.
-func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiveKey string) bool {
+func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiveKey string, managers ...*SessionManager) bool {
 	e.interactiveMu.Lock()
 	state, hasState := e.interactiveStates[interactiveKey]
 	if !hasState || state == nil {
@@ -3428,6 +3428,13 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	if e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs) {
 		snap := userMessageWatermarkSnapshotLocked(state)
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
+		return true
+	}
+	sessions := e.sessions
+	if len(managers) > 0 {
+		sessions = managers[0]
+	}
+	if e.steerBusyMessageLocked(state, p, msg, sessions) {
 		return true
 	}
 	if len(state.pendingMessages) >= e.maxQueuedMessages {

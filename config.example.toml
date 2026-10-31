@@ -1688,8 +1688,8 @@ app_secret = "your-feishu-app-secret"
 # GPT-6.1 Sol 需要 Codex CLI 0.159.1 或更新版本；请更新 cmd/CODEX_CLI_PATH/PATH 实际选中的 CLI。
 # Model availability also depends on your ChatGPT plan or API account.
 # 模型可用性还取决于 ChatGPT 套餐或 API 账号。
-# Codex uses `codex exec --json` under the hood.
-# Codex 底层使用 `codex exec --json` 命令。
+# Codex defaults to `codex app-server` with active-turn steering.
+# Codex 默认使用 `codex app-server`，支持活动轮次 steer。
 
 # [[projects]]
 # name = "my-codex-project"
@@ -1702,6 +1702,9 @@ app_secret = "your-feishu-app-secret"
 # ChatGPT.app、Codex.app 的新旧内置 CLI 目录。详见 docs/usage.zh-CN.md。
 #
 # [projects.agent.options]
+# backend = "app_server" # Default: steer ordinary messages into the active turn.
+# backend = "exec"       # Legacy opt-in: queue busy messages until the turn ends.
+
 # work_dir = "/path/to/project"
 # mode = "suggest"  # "suggest" | "auto-edit" | "full-auto" | "yolo"
 #

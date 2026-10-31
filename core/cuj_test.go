@@ -146,6 +146,151 @@ func TestCUJ_A9_PsAndBtwSupplementRunningTask(t *testing.T) {
 	}
 }
 
+type ordinarySteerSession struct {
+	stubAgentSession
+	mu         sync.Mutex
+	active     bool
+	prompt     string
+	supplement string
+	started    chan string
+	events     chan Event
+}
+
+func (s *ordinarySteerSession) Events() <-chan Event { return s.events }
+func (s *ordinarySteerSession) Send(prompt, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	s.active = true
+	s.prompt = prompt
+	s.supplement = ""
+	s.mu.Unlock()
+	s.started <- prompt
+	return nil
+}
+func (s *ordinarySteerSession) SteerMessage(prompt, _ string, _ []ImageAttachment, _ []FileAttachment) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return false, nil
+	}
+	s.supplement = prompt
+	return true, nil
+}
+func (s *ordinarySteerSession) finish() {
+	s.mu.Lock()
+	s.active = false
+	text := "completed using: " + s.supplement + " for " + s.prompt
+	s.mu.Unlock()
+	s.events <- Event{Type: EventResult, Content: text, Done: true}
+}
+
+// Sub-case of A9: ordinary messages supplement the running task without /ps.
+func TestCUJ_A9_OrdinaryMessagesSteerAndPreserveHistory(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	s := &ordinarySteerSession{started: make(chan string, 4), events: make(chan Event, 4)}
+	e := NewEngine("ordinary-steer", &resultAgent{session: s}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	key := "test:chat:user"
+	send := func(text string) { e.ReceiveMessage(p, &Message{SessionKey: key, UserID: "user", Content: text}) }
+	waitStarted := func() {
+		t.Helper()
+		select {
+		case <-s.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("message did not start a turn")
+		}
+	}
+	waitVisible := func(text string) {
+		t.Helper()
+		deadline := time.After(2 * time.Second)
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			if strings.Contains(strings.Join(p.getSent(), "\n"), text) {
+				return
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("missing %q: %v", text, p.getSent())
+			case <-tick.C:
+			}
+		}
+	}
+	// Action 1: start a held turn. Action 2: supplement with ordinary input.
+	send("start task")
+	waitStarted()
+	send("include unit tests")
+	waitVisible(e.i18n.T(MsgMessageSteered))
+	s.finish()
+	waitVisible("completed using: include unit tests")
+	// Action 3: inspect history through the same platform entrypoint.
+	send("/history")
+	waitVisible("start task")
+	waitVisible("include unit tests")
+	// Action 4: an idle message starts a fresh turn and receives a result.
+	send("next task")
+	waitStarted()
+	s.finish()
+	waitVisible("for next task")
+}
+
+func TestCUJ_A9_OrdinaryMessageAtTurnEndIsDeliveredOnce(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	s := &ordinarySteerSession{started: make(chan string, 4), events: make(chan Event, 4)}
+	e := NewEngine("steer-end", &resultAgent{session: s}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	key := "test:chat:user"
+	send := func(text string) { e.ReceiveMessage(p, &Message{SessionKey: key, UserID: "user", Content: text}) }
+	waitStarted := func(want string) {
+		t.Helper()
+		select {
+		case got := <-s.started:
+			if got != want {
+				t.Fatalf("started %q, want %q", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("queued input did not start")
+		}
+	}
+	waitVisible := func(want string) {
+		t.Helper()
+		deadline := time.After(2 * time.Second)
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			if strings.Contains(strings.Join(p.getSent(), "\n"), want) {
+				return
+			}
+			select {
+			case <-tick.C:
+			case <-deadline:
+				t.Fatalf("missing %q: %v", want, p.getSent())
+			}
+		}
+	}
+	// Action 1 starts a turn. The backend ends it before notifying the engine.
+	send("first task")
+	waitStarted("first task")
+	s.mu.Lock()
+	s.active = false
+	s.mu.Unlock()
+	// Action 2 arrives in that window, so it must fall back to the queue.
+	send("late input")
+	waitVisible(e.i18n.T(MsgMessageQueued))
+	s.finish()
+	waitStarted("late input")
+	s.finish()
+	waitVisible("for late input")
+	// Action 3 exposes the retained message through history.
+	p.clearSent()
+	send("/history")
+	waitVisible("late input")
+	select {
+	case extra := <-s.started:
+		t.Fatalf("input replayed as %q", extra)
+	default:
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helper types: cujAgent + cujAgentSession give per-CUJ control over what the
 // agent "replies" for each user prompt, without bringing up a real LLM.
