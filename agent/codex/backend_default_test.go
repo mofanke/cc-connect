@@ -4,7 +4,8 @@ import "testing"
 
 func TestNew_DefaultBackendSupportsOrdinarySteering(t *testing.T) {
 	for _, backend := range []string{"", "app_server", "exec"} {
-		agent, err := New(map[string]any{"work_dir": t.TempDir(), "backend": backend})
+		// Constructor parsing should not require a Codex installation in CI.
+		agent, err := New(map[string]any{"work_dir": t.TempDir(), "backend": backend, "cmd": "go"})
 		if err != nil {
 			t.Fatal(err)
 		}
