@@ -1296,3 +1296,28 @@ tunneled through it.
 
 Full reference: [docs/telegram.md](./telegram.md#21-optional-use-a-proxy).
 This option was added in PR #389.
+
+### Codex Fast requests
+
+Use `/fast` to view the request preference, `/fast on` to request Fast, and
+`/fast off` to request standard speed. These controls require Codex CLI 0.166.0
+or newer. The default is standard speed (`service_tier = "default"`); set
+`service_tier = "fast"` in the Codex agent options to change the initial preference.
+
+Changes apply to the next new turn, including new, resumed, and switched
+sessions. They preserve the current turn, its tier, and session history. Ordinary
+messages sent while busy still steer the active turn. Preferences persist in
+project state; each bound workspace can store its own override.
+
+The app-server backend sends `serviceTier` on thread start/resume and
+`serviceTierForTurn` on each new turn. Fast maps to the provider's `priority`
+tier. Thread setup checks the returned setting and reports ignored or rejected
+Fast requests. The exec backend does not support `/fast` switching: Codex 0.166.0 can retain
+a resumed thread's prior tier despite `-c service_tier="default"`. Commands and
+Fast configuration on that backend return an explicit error; use app_server. An enabled request preference
+alone does not prove account/model acceptance or faster execution. Errors are
+reported when the backend runs the request.
+
+For Feishu, register `/fast` as a native Slash Command only after code review,
+release, and mode acceptance. Select it in the input box, add `on` or `off`, then
+send manually. Do not add a bottom menu item that sends the command on click.

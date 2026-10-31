@@ -41,6 +41,119 @@ import (
 	"time"
 )
 
+type cujFastAgent struct {
+	cujAgent
+	fastMu  sync.Mutex
+	fast    bool
+	ids     []string
+	history map[string][]HistoryEntry
+}
+
+func (a *cujFastAgent) FastModeSupported() error { return nil }
+func (a *cujFastAgent) FastModeEnabled() bool {
+	a.fastMu.Lock()
+	defer a.fastMu.Unlock()
+	return a.fast
+}
+func (a *cujFastAgent) SetFastMode(v bool) { a.fastMu.Lock(); defer a.fastMu.Unlock(); a.fast = v }
+func (a *cujFastAgent) StartSession(_ context.Context, id string) (AgentSession, error) {
+	a.fastMu.Lock()
+	defer a.fastMu.Unlock()
+	if id == "" || id == ContinueSession {
+		id = fmt.Sprintf("fast-session-%d", len(a.ids)+1)
+		a.ids = append(a.ids, id)
+	}
+	return &cujFastSession{cujAgentSession: newCUJAgentSession(), agent: a, id: id}, nil
+}
+func (a *cujFastAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	a.fastMu.Lock()
+	defer a.fastMu.Unlock()
+	var list []AgentSessionInfo
+	for _, id := range a.ids {
+		list = append(list, AgentSessionInfo{ID: id, Summary: id})
+	}
+	return list, nil
+}
+
+func (a *cujFastAgent) GetSessionHistory(_ context.Context, id string, _ int) ([]HistoryEntry, error) {
+	a.fastMu.Lock()
+	defer a.fastMu.Unlock()
+	return append([]HistoryEntry(nil), a.history[id]...), nil
+}
+
+type cujFastSession struct {
+	*cujAgentSession
+	agent *cujFastAgent
+	id    string
+}
+
+func (s *cujFastSession) CurrentSessionID() string { return s.id }
+
+func (s *cujFastSession) Send(prompt, id string, images []ImageAttachment, files []FileAttachment) error {
+	s.mu.Lock()
+	s.reply = fmt.Sprintf("answer with Fast preference %v: %s", s.agent.FastModeEnabled(), prompt)
+	reply := s.reply
+	s.mu.Unlock()
+	s.agent.fastMu.Lock()
+	if s.agent.history == nil {
+		s.agent.history = make(map[string][]HistoryEntry)
+	}
+	s.agent.history[s.id] = append(s.agent.history[s.id], HistoryEntry{Role: "user", Content: prompt}, HistoryEntry{Role: "assistant", Content: reply})
+	s.agent.fastMu.Unlock()
+	return s.cujAgentSession.Send(prompt, id, images, files)
+}
+
+// CUJ: change the preference without losing history, create another session,
+// switch back, and restart the engine with the saved preference.
+func TestCUJ_F1_FastPreferenceSurvivesSessionSwitchAndRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "project.json")
+	ag := &cujFastAgent{}
+	env := newCUJEnv(t)
+	env.engine.agent = ag
+	env.engine.SetProjectStateStore(NewProjectStateStore(path))
+	t.Cleanup(func() { _ = env.engine.Stop() })
+	env.userSends("alice", "/fast ON")
+	if !strings.Contains(env.lastSent(), "preference: on") || !strings.Contains(env.lastSent(), "next new turn") {
+		t.Fatalf("reply=%s", env.lastSent())
+	}
+	env.userSends("alice", "first-session-message")
+	env.waitFor("first answer", 2*time.Second, func() bool { return env.sentContains("answer with Fast preference true: first-session-message") })
+	s1 := env.activeSession("test:alice")
+	env.waitFor("first history saved", 2*time.Second, func() bool { return len(s1.GetHistory(0)) >= 2 })
+	firstAgentID := s1.GetAgentSessionID()
+	env.userSends("alice", "/new second")
+	env.userSends("alice", "/fast")
+	if !strings.Contains(env.lastSent(), "preference: on") {
+		t.Fatal(env.lastSent())
+	}
+	env.userSends("alice", "second-session-message")
+	env.waitFor("second answer", 2*time.Second, func() bool { return env.sentContains("answer with Fast preference true: second-session-message") })
+	env.userSends("alice", "/switch "+firstAgentID)
+	env.userSends("alice", "/fast off")
+	if !strings.Contains(env.lastSent(), "preference: off") {
+		t.Fatal(env.lastSent())
+	}
+	env.plat.clearSent()
+	env.userSends("alice", "/history")
+	if !env.sentContains("first-session-message") {
+		t.Fatalf("fast/switch lost history: %s", env.lastSent())
+	}
+	_ = env.engine.Stop()
+	for i, cmd := range []string{"/fast on", "/fast off"} {
+		fresh := &cujFastAgent{}
+		p := &stubPlatformEngine{n: "test"}
+		e := NewEngine("test", fresh, []Platform{p}, "", LangEnglish)
+		e.SetProjectStateStore(NewProjectStateStore(path))
+		e.ReceiveMessage(p, &Message{SessionKey: "test:alice", Content: "/fast", ReplyCtx: "ctx"})
+		want := []string{"off", "on"}[i]
+		if !strings.Contains(p.getSent()[0], "preference: "+want) {
+			t.Fatalf("restart=%v", p.getSent())
+		}
+		e.ReceiveMessage(p, &Message{SessionKey: "test:alice", Content: cmd, ReplyCtx: "ctx"})
+		_ = e.Stop()
+	}
+}
+
 // CUJ: submit work during slow startup, queue a follow-up while the agent is
 // working, then check status. Both messages have receipts before either answer;
 // draining the queue must preserve each receipt without adding another one.

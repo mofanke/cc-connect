@@ -1201,3 +1201,22 @@ proxy_password = ""
 
 完整说明见 [docs/telegram.md](./telegram.md#21-optional-use-a-proxy)（英文原文，
 `docs/telegram.md` 目前只有英文版）。该配置由 PR #389 引入。
+
+### Codex Fast 请求
+
+`/fast` 查询请求设置，`/fast on` 请求 Fast，`/fast off` 请求标准速度。
+需要 Codex CLI 0.166.0 或更新版本。默认标准速度（`service_tier = "default"`）；
+可在 Codex Agent options 中配置 `service_tier = "fast"` 修改初始设置。
+
+更改从下一新轮次生效，包括新建、恢复和切换会话；保留当前轮次、原速度层级和历史。
+忙碌时的普通消息继续 steer 当前轮次。设置保存在项目状态中，绑定工作区可分别覆盖。
+
+app_server 在线程创建/恢复请求中传入 `serviceTier`，在每个新轮次传入
+`serviceTierForTurn`。Fast 对应上游 `priority`。线程初始化会核对后端返回的设置，
+忽略或拒绝 Fast 时报告错误。exec 不支持 `/fast` 切换：Codex 0.166.0 恢复线程时，
+即使传入 `-c service_tier="default"`，仍可能保留原层级。该后端的命令及 Fast 配置会明确报错，
+请使用 app_server。开关开启只代表请求设置，不证明账号、模型已接受或执行更快；
+后端执行时的拒绝会作为错误报告。
+
+飞书原生 Slash Command 的生产入口须在代码审核、发布及模式验收后注册。
+在输入框选择 `/fast`，继续追加 `on` 或 `off`，再手动发送；不要新增点击即发送的底部菜单。
